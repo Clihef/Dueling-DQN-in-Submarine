@@ -1,0 +1,870 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>DQN Emergency Decision-Making — Training Data Flow (v2 · Range-Constrained)</title>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@300;400;600;700&display=swap" rel="stylesheet">
+<style>
+:root {
+  --bg: #0d1117;
+  --surface: #161b22;
+  --border: #30363d;
+  --text: #c9d1d9;
+  --muted: #8b949e;
+  --accent: #58a6ff;
+  --green: #3fb950;
+  --orange: #d2991d;
+  --red: #f85149;
+  --purple: #bc8cff;
+  --cyan: #39d2c0;
+  --pink: #db61a2;
+  --sim: #58a6ff;
+  --dqn: #3fb950;
+  --util: #d2991d;
+  --train: #bc8cff;
+  --core: #f85149;
+  --flow-line: #30363d;
+  --flow-arrow: #58a6ff;
+}
+
+* { margin: 0; padding: 0; box-sizing: border-box; }
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: 'IBM Plex Sans', system-ui, sans-serif;
+  line-height: 1.6;
+  -webkit-font-smoothing: antialiased;
+}
+
+.container {
+  max-width: 1200px;
+  margin: 0 auto;
+  padding: 60px 40px;
+}
+
+/* Header */
+.header {
+  text-align: center;
+  margin-bottom: 64px;
+}
+.header h1 {
+  font-size: 2rem;
+  font-weight: 700;
+  letter-spacing: -0.02em;
+  color: #f0f6fc;
+  margin-bottom: 8px;
+}
+.header .subtitle {
+  font-size: 0.95rem;
+  color: var(--muted);
+  font-weight: 300;
+}
+.header .meta {
+  display: flex;
+  justify-content: center;
+  gap: 24px;
+  margin-top: 16px;
+  font-size: 0.8rem;
+  color: var(--muted);
+  font-family: 'IBM Plex Mono', monospace;
+}
+.header .meta span { display: flex; align-items: center; gap: 6px; }
+.header .meta .dot {
+  width: 8px; height: 8px; border-radius: 50%; display: inline-block;
+}
+.header .version-badge {
+  display: inline-block;
+  background: var(--accent);
+  color: #000;
+  font-size: 0.7rem;
+  font-weight: 700;
+  padding: 3px 8px;
+  border-radius: 4px;
+  margin-left: 12px;
+  vertical-align: middle;
+  font-family: 'IBM Plex Mono', monospace;
+}
+
+/* Section titles */
+.section-title {
+  font-size: 1.2rem;
+  font-weight: 700;
+  color: #f0f6fc;
+  margin: 48px 0 20px;
+  padding-bottom: 8px;
+  border-bottom: 2px solid var(--border);
+  letter-spacing: -0.01em;
+}
+.section-title .num {
+  color: var(--accent);
+  margin-right: 8px;
+  font-family: 'IBM Plex Mono', monospace;
+  font-size: 0.9rem;
+}
+
+/* Architecture overview */
+.arch-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 16px;
+  margin-bottom: 32px;
+}
+.arch-card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 20px;
+  position: relative;
+}
+.arch-card h3 {
+  font-size: 0.85rem;
+  font-weight: 600;
+  margin-bottom: 12px;
+  font-family: 'IBM Plex Mono', monospace;
+  display: flex; align-items: center; gap: 8px;
+}
+.arch-card h3 .icon { font-size: 1.1rem; }
+.arch-card ul {
+  list-style: none;
+  font-size: 0.82rem;
+  color: var(--muted);
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.arch-card ul li {
+  background: rgba(255,255,255,0.04);
+  padding: 3px 10px;
+  border-radius: 4px;
+  font-family: 'IBM Plex Mono', monospace;
+  font-size: 0.78rem;
+}
+.arch-card.sim { border-left: 3px solid var(--sim); }
+.arch-card.dqn { border-left: 3px solid var(--dqn); }
+.arch-card.util { border-left: 3px solid var(--orange); }
+
+/* Flow diagram */
+.flow-container {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 32px 24px;
+  overflow-x: auto;
+}
+.flow-step {
+  display: flex;
+  align-items: flex-start;
+  gap: 0;
+  margin-bottom: 0;
+  position: relative;
+}
+.flow-step:last-child { margin-bottom: 0; }
+
+.step-node {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 10px 16px;
+  font-family: 'IBM Plex Mono', monospace;
+  font-size: 0.78rem;
+  white-space: nowrap;
+  position: relative;
+  z-index: 1;
+  flex-shrink: 0;
+  transition: all 0.2s;
+}
+.step-node:hover {
+  border-color: var(--accent);
+  box-shadow: 0 0 12px rgba(88,166,255,0.15);
+}
+.step-node.core { border-color: rgba(248,81,73,0.4); }
+.step-node.sim  { border-color: rgba(88,166,255,0.4); }
+.step-node.dqn  { border-color: rgba(63,185,80,0.4); }
+.step-node.util { border-color: rgba(210,153,29,0.4); }
+.step-node.loop { border-color: rgba(188,140,255,0.4); background: rgba(188,140,255,0.05); }
+.step-node.new  { border-color: rgba(57,210,192,0.5); background: rgba(57,210,192,0.06); }
+
+.step-arrow {
+  display: flex; align-items: center;
+  padding: 0 8px;
+  color: var(--flow-arrow);
+  font-size: 1rem;
+  flex-shrink: 0;
+  margin-top: 10px;
+}
+.step-label {
+  font-size: 0.72rem;
+  color: var(--muted);
+  margin-left: 8px;
+  white-space: nowrap;
+  margin-top: 12px;
+}
+
+/* Row layout for horizontal flow */
+.flow-row {
+  display: flex;
+  align-items: center;
+  gap: 0;
+  margin-bottom: 12px;
+  flex-wrap: wrap;
+}
+.flow-row-label {
+  font-size: 0.72rem;
+  color: var(--muted);
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  width: 80px;
+  flex-shrink: 0;
+  text-align: right;
+  margin-right: 12px;
+}
+
+/* Phase blocks */
+.phase {
+  margin-bottom: 28px;
+  position: relative;
+}
+.phase-title {
+  font-size: 0.8rem;
+  font-weight: 700;
+  color: var(--accent);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  margin-bottom: 14px;
+  font-family: 'IBM Plex Mono', monospace;
+  display: flex; align-items: center; gap: 8px;
+}
+.phase-title::before {
+  content: '';
+  display: inline-block;
+  width: 10px; height: 10px;
+  border-radius: 2px;
+  background: var(--accent);
+}
+
+/* State vector table */
+.state-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.8rem;
+  margin: 16px 0;
+}
+.state-table th {
+  background: var(--bg);
+  color: var(--muted);
+  font-weight: 600;
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  padding: 8px 12px;
+  text-align: left;
+  border-bottom: 2px solid var(--border);
+}
+.state-table td {
+  padding: 7px 12px;
+  border-bottom: 1px solid rgba(48,54,61,0.5);
+  font-family: 'IBM Plex Mono', monospace;
+  font-size: 0.76rem;
+}
+.state-table tr:hover td { background: rgba(88,166,255,0.04); }
+.state-table .dim { color: var(--muted); font-size: 0.7rem; }
+.state-table .val { color: var(--accent); }
+.state-table .new-val { color: var(--cyan); font-weight: 600; }
+.state-table .section-row td {
+  background: rgba(255,255,255,0.02);
+  font-weight: 600;
+  color: #f0f6fc;
+  font-size: 0.75rem;
+  letter-spacing: 0.03em;
+  border-bottom: 1px solid var(--border);
+}
+
+/* Decision loop */
+.loop-box {
+  border: 1px dashed var(--purple);
+  border-radius: 10px;
+  padding: 20px;
+  margin: 12px 0;
+  background: rgba(188,140,255,0.03);
+  position: relative;
+}
+.loop-box-label {
+  position: absolute;
+  top: -10px;
+  left: 16px;
+  background: var(--surface);
+  padding: 0 10px;
+  font-size: 0.72rem;
+  font-weight: 700;
+  color: var(--purple);
+  font-family: 'IBM Plex Mono', monospace;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+/* Mini flow arrows */
+.mini-flow {
+  display: flex; align-items: center; gap: 8px;
+  flex-wrap: wrap;
+  margin: 8px 0;
+}
+.mini-node {
+  font-family: 'IBM Plex Mono', monospace;
+  font-size: 0.73rem;
+  padding: 5px 10px;
+  border-radius: 4px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  white-space: nowrap;
+}
+.mini-arrow { color: var(--muted); font-size: 0.9rem; }
+
+/* File structure */
+.file-tree {
+  font-family: 'IBM Plex Mono', monospace;
+  font-size: 0.8rem;
+  line-height: 1.8;
+}
+.file-tree .dir { color: var(--accent); font-weight: 600; }
+.file-tree .file { color: var(--muted); padding-left: 24px; }
+.file-tree .comment { color: rgba(139,148,158,0.5); font-size: 0.72rem; margin-left: 8px; }
+
+/* Legend */
+.legend {
+  display: flex; gap: 20px; flex-wrap: wrap;
+  padding: 12px 0;
+  margin-bottom: 24px;
+}
+.legend-item {
+  display: flex; align-items: center; gap: 6px;
+  font-size: 0.75rem; color: var(--muted);
+}
+.legend-dot {
+  width: 10px; height: 10px; border-radius: 2px;
+}
+
+/* Reward formula */
+.formula-box {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 16px 20px;
+  font-family: 'IBM Plex Mono', monospace;
+  font-size: 0.78rem;
+  margin: 12px 0;
+  color: var(--accent);
+}
+.formula-box .comment { color: var(--muted); font-size: 0.7rem; }
+.formula-box .highlight { color: var(--cyan); font-weight: 600; }
+
+/* Highlight box */
+.highlight-box {
+  background: rgba(57,210,192,0.06);
+  border: 1px solid rgba(57,210,192,0.3);
+  border-radius: 8px;
+  padding: 14px 18px;
+  margin: 10px 0;
+  font-size: 0.76rem;
+}
+
+/* Two-column */
+.two-col {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 20px;
+}
+.three-col {
+  display: grid;
+  grid-template-columns: 1fr 1fr 1fr;
+  gap: 16px;
+}
+@media (max-width: 860px) { .two-col, .three-col { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body>
+
+<div class="container">
+
+<!-- Header -->
+<header class="header">
+  <h1>DQN 突发事件临机决策 — 训练数据流 <span class="version-badge">v2 · 航程约束</span></h1>
+  <p class="subtitle">Multi-UAV Collaborative Search · Emergency On-Spot Decision-Making with Range Constraint</p>
+  <div class="meta">
+    <span><span class="dot" style="background:var(--sim)"></span> Simulator</span>
+    <span><span class="dot" style="background:var(--dqn)"></span> DQN Agent</span>
+    <span><span class="dot" style="background:var(--orange)"></span> Utils</span>
+    <span><span class="dot" style="background:var(--purple)"></span> Decision Loop</span>
+    <span><span class="dot" style="background:var(--red)"></span> Core Library</span>
+    <span><span class="dot" style="background:var(--cyan)"></span> NEW in v2</span>
+  </div>
+</header>
+
+<!-- ==================== 1. Architecture ==================== -->
+<div class="section-title"><span class="num">01</span> File Structure</div>
+
+<div class="arch-grid">
+  <div class="arch-card sim">
+    <h3><span class="icon">&#9881;</span> emergency/</h3>
+    <ul>
+      <li>agent.py</li><li>simulator.py</li><li>utils.py</li>
+      <li>train.py</li><li>eval.py</li><li>demo.py</li>
+      <li>plot_training.py</li>
+    </ul>
+  </div>
+  <div class="arch-card dqn">
+    <h3><span class="icon">&#9883;</span> core/</h3>
+    <ul>
+      <li>heatmap.py</li><li>ga_allocator.py</li>
+      <li>spiral_search.py</li><li>dubins_planner.py</li>
+      <li>uav_navi.py</li>
+    </ul>
+  </div>
+  <div class="arch-card util">
+    <h3><span class="icon">&#128196;</span> docs/ + root</h3>
+    <ul>
+      <li>main.py</li><li>CLAUDE.md</li>
+      <li>scenario_v1.md</li>
+      <li>simulator_and_utils.md</li>
+      <li>Modification_direction.md</li>
+    </ul>
+  </div>
+</div>
+
+<div class="legend">
+  <div class="legend-item"><span class="legend-dot" style="background:var(--sim)"></span> EmergencySimulator</div>
+  <div class="legend-item"><span class="legend-dot" style="background:var(--dqn)"></span> EmergencyDQN / agent</div>
+  <div class="legend-item"><span class="legend-dot" style="background:var(--orange)"></span> utils (FSM, state, routing, range)</div>
+  <div class="legend-item"><span class="legend-dot" style="background:var(--purple)"></span> Per-target decision loop</div>
+  <div class="legend-item"><span class="legend-dot" style="background:var(--red)"></span> core/ GA + path planning</div>
+  <div class="legend-item"><span class="legend-dot" style="background:var(--cyan)"></span> v2 新增: 航程约束/逐步奖励</div>
+</div>
+
+<!-- ==================== 2. Key Changes v2 ==================== -->
+<div class="section-title"><span class="num">01.5</span> v2 核心变更摘要</div>
+
+<div class="three-col">
+  <div class="highlight-box">
+    <strong style="color:var(--cyan)">航程约束</strong><br>
+    <span style="font-size:0.73rem;color:var(--muted)">
+      MAX_RANGE = <b>150 km</b> 硬上限<br>
+      SOFT_RANGE = <b>120 km</b> (80%) 软阈值<br>
+      致命越限: 任何UAV超150km → fatal penalty
+    </span>
+  </div>
+  <div class="highlight-box">
+    <strong style="color:var(--cyan)">逐步即时奖励</strong><br>
+    <span style="font-size:0.73rem;color:var(--muted)">
+      中间步骤: <b>compute_step_reward()</b><br>
+      (增量飞行 + 搜索 + range pressure)<br>
+      终端步骤: 全局代价 + 越限惩罚
+    </span>
+  </div>
+  <div class="highlight-box">
+    <strong style="color:var(--cyan)">状态 34→38 维</strong><br>
+    <span style="font-size:0.73rem;color:var(--muted)">
+      新增 4 维 UAV 航程利用率<br>
+      动作 0 (放弃) 不再被 S2/S4 屏蔽<br>
+      consumed_ranges 贯穿全流程
+    </span>
+  </div>
+</div>
+
+<!-- ==================== 3. Episode Flow ==================== -->
+<div class="section-title"><span class="num">02</span> Per-Episode Training Flow <span style="font-weight:400;color:var(--cyan);font-size:0.8rem">— updated v2</span></div>
+
+<div class="flow-container">
+
+  <!-- Phase: Init -->
+  <div class="phase">
+    <div class="phase-title">Phase A — 一次性初始化 (训练开始前)</div>
+    <div class="flow-row">
+      <span class="flow-row-label">GA 基线</span>
+      <span class="step-node core">ga.run_ga()</span>
+      <span class="step-arrow">→</span>
+      <span class="step-node sim">baseline_routes</span>
+      <span class="step-arrow">→</span>
+      <span class="step-node core">Dubins + Spiral</span>
+      <span class="step-arrow">→</span>
+      <span class="step-node sim">ref_paths<br>+ route_boundaries</span>
+      <span class="step-label">(各UAV每目标累积路径距离)</span>
+    </div>
+  </div>
+
+  <!-- Phase: Emergency -->
+  <div class="phase">
+    <div class="phase-title">Phase B — 突发事件触发 (每回合)</div>
+    <div class="flow-row">
+      <span class="flow-row-label">事件生成</span>
+      <span class="step-node sim">generate_random<br>_emergency()</span>
+      <span class="step-arrow">→</span>
+      <span class="step-node sim">S1: shifts<br>S2: new_targets<br>S3: no_fly_zone<br>S4: failed_uav</span>
+      <span class="step-arrow">→</span>
+      <span class="step-node sim">trigger_time_frac<br>(0.3~0.7)</span>
+    </div>
+    <div class="flow-row" style="margin-top:8px">
+      <span class="flow-row-label">位置推算</span>
+      <span class="step-node sim">simulate_until<br>_emergency()</span>
+      <span class="step-arrow">→</span>
+      <span class="step-node sim">uav_positions<br>(4,2) km</span>
+      <span class="step-arrow">→</span>
+      <span class="step-node sim">completed (set)<br>remaining (set)</span>
+      <span class="step-arrow">→</span>
+      <span class="step-node new">consumed_ranges<br>[4] km ← NEW</span>
+      <span class="step-label">精确判定: trigger_dist ≥ route_boundaries[k][i]</span>
+    </div>
+    <div class="flow-row" style="margin-top:8px">
+      <span class="flow-row-label">S1 过滤</span>
+      <span class="step-node util">filter shifts<br>∉ completed</span>
+      <span class="step-arrow">→</span>
+      <span class="step-node sim">apply_emergency()</span>
+      <span class="step-arrow">→</span>
+      <span class="step-node sim">modified_hotspots<br>active_uavs</span>
+      <span class="step-arrow">→</span>
+      <span class="step-node util">get_affected<br>_targets()</span>
+      <span class="step-arrow">→</span>
+      <span class="step-node util">affected[]<br>权重降序</span>
+      <span class="step-arrow">→</span>
+      <span class="step-node util">filter ∉ completed</span>
+    </div>
+  </div>
+
+  <!-- Phase: Decision Loop -->
+  <div class="phase">
+    <div class="phase-title">Phase C — DQN 逐目标决策循环 <span style="font-weight:400;color:var(--muted)">for each target ∈ affected</span></div>
+
+    <div class="loop-box">
+      <span class="loop-box-label">Per-Target Step</span>
+      <div class="mini-flow">
+        <span class="mini-node" style="border-color:rgba(210,153,29,0.6)">build_state_vector<br>(38-dim, +consumed_ranges)</span>
+        <span class="mini-arrow">→</span>
+        <span class="mini-node" style="border-color:rgba(63,185,80,0.6);color:var(--green)">38-dim state</span>
+        <span class="mini-arrow">→</span>
+        <span class="mini-node" style="border-color:rgba(63,185,80,0.6)">get_valid_actions<br>(S2/S4 不再屏蔽0)</span>
+        <span class="mini-arrow">→</span>
+        <span class="mini-node" style="border-color:rgba(63,185,80,0.6)">DQN.forward()</span>
+        <span class="mini-arrow">→</span>
+        <span class="mini-node" style="border-color:rgba(63,185,80,0.6);color:var(--green)">5 Q-values</span>
+        <span class="mini-arrow">→</span>
+        <span class="mini-node" style="border-color:rgba(63,185,80,0.6)">ε-greedy<br>select_action()</span>
+        <span class="mini-arrow">→</span>
+        <span class="mini-node" style="color:var(--orange)">action 0-4</span>
+        <span class="mini-arrow">→</span>
+        <span class="mini-node" style="border-color:rgba(210,153,29,0.6)">apply_decision()</span>
+      </div>
+      <div style="margin-top:10px;font-size:0.72rem;color:var(--muted)">
+        <span style="color:var(--orange)">action=0</span> → 放弃 (abandoned_targets) &nbsp;|&nbsp;
+        <span style="color:var(--orange)">action=1-4</span> → 从其他UAV移除 → 追加到目标UAV路由
+      </div>
+      <div class="highlight-box" style="margin-top:10px">
+        <strong style="color:var(--cyan)">中间步 (v2·新):</strong>
+        next_state = build_state_vector(next_target, …, consumed_ranges) →
+        <span style="color:var(--cyan)">step_reward = sim.compute_step_reward(action, target, routes, pos, consumed_ranges, hotspot_map)</span> →
+        replay_buffer.add(s, a, <span style="color:var(--cyan)">step_reward</span>, s', <b>done=False</b>)
+      </div>
+    </div>
+  </div>
+
+  <!-- Phase: Post-process -->
+  <div class="phase">
+    <div class="phase-title">Phase D — 后处理 &amp; 代价计算 (最终步)</div>
+
+    <div class="flow-row">
+      <span class="flow-row-label">路径优化</span>
+      <span class="step-node util">nearest_neighbor<br>_reorder()</span>
+      <span class="step-arrow">→</span>
+      <span class="step-node util">balance_routes()</span>
+      <span class="step-arrow">→</span>
+      <span class="step-node util">remove abandoned</span>
+      <span class="step-arrow">→</span>
+      <span class="step-node sim">clean_routes</span>
+      <span class="step-label">负载: spiral_time &nbsp;|&nbsp; 阈值: max &lt; avg×1.3</span>
+    </div>
+    <div class="flow-row" style="margin-top:8px">
+      <span class="flow-row-label">代价计算</span>
+      <span class="step-node sim">compute_cost<br>_for_assignment<br>(+consumed_ranges)</span>
+      <span class="step-arrow">→</span>
+      <span class="step-node new">J_max, J_sum<br>range_violations<br>max_range_ratio</span>
+      <span class="step-arrow">→</span>
+      <span class="step-node sim">baseline cost<br>(零方案, 同样传入<br>consumed_ranges)</span>
+      <span class="step-arrow">→</span>
+      <span class="step-node sim">compute_reward()</span>
+      <span class="step-arrow">→</span>
+      <span class="step-node dqn" style="color:var(--green)">terminal reward<br>(含 fatal penalty)</span>
+    </div>
+    <div class="flow-row" style="margin-top:8px">
+      <span class="flow-row-label">存储</span>
+      <span class="step-node dqn">replay_buffer.add<br>(s,a,reward,0,<b>done=True</b>)</span>
+      <span class="step-arrow">→</span>
+      <span class="step-node dqn">replay_buffer<br>.sample(batch)</span>
+      <span class="step-arrow">→</span>
+      <span class="step-node dqn">TD update + PER<br>update_priorities</span>
+    </div>
+  </div>
+</div>
+
+<!-- ==================== 4. Reward Design (Rewritten) ==================== -->
+<div class="section-title"><span class="num">03</span> Reward Design <span style="font-weight:400;color:var(--cyan);font-size:0.8rem">— v2 两段式奖励</span></div>
+
+<div class="two-col">
+  <div>
+    <div style="font-size:0.82rem;font-weight:700;color:var(--cyan);margin-bottom:8px;font-family:'IBM Plex Mono',monospace">中间步骤奖励 (done=False)</div>
+    <div class="formula-box" style="border-color:rgba(57,210,192,0.4)">
+      <span class="highlight">compute_step_reward(action, target, routes, pos, consumed_ranges, hotspot_map)</span><br><br>
+      <span style="color:var(--text)">if action == 0 (放弃):</span><br>
+      &nbsp;&nbsp;<span style="color:var(--orange)">r_step</span> = <span class="comment">−target.weight × 0.5</span><br>
+      &nbsp;&nbsp;<span class="comment">(机会成本: 权重越高放弃代价越大)</span><br><br>
+      <span style="color:var(--text)">if action ∈ {1,2,3,4} (指派给UAV_k):</span><br>
+      &nbsp;&nbsp;<span style="color:var(--text)">incremental_dist</span> = <span class="comment">∥UAV_k_last_pos → target∥</span><br>
+      &nbsp;&nbsp;<span style="color:var(--text)">spiral_km</span> = <span class="comment">target.spiral_dist / 1000</span><br>
+      &nbsp;&nbsp;<span style="color:var(--text)">extra_km</span> = incremental_dist + spiral_km<br>
+      &nbsp;&nbsp;<span style="color:var(--text)">range_after</span> = consumed_ranges[k] + extra_km<br>
+      &nbsp;&nbsp;<span style="color:var(--text)">range_pressure</span> = <span class="comment">clamp((range_after − 120) / 30, 0, 1)</span><br>
+      &nbsp;&nbsp;<span class="comment">// 0 when &lt;80%MAX, linear to 1.0 at 100%MAX</span><br>
+      &nbsp;&nbsp;<span style="color:var(--orange)">r_step</span> = <span class="comment">−(extra_km / 0.05 / 5000 + range_pressure × 0.5)</span><br>
+      &nbsp;&nbsp;<span class="comment">// 物理代价归一化 + 航程压力惩罚</span><br><br>
+      <span class="comment">NORM = 5000s (≈150km飞行时间)</span>
+    </div>
+  </div>
+  <div>
+    <div style="font-size:0.82rem;font-weight:700;color:var(--green);margin-bottom:8px;font-family:'IBM Plex Mono',monospace">终端步骤奖励 (done=True)</div>
+    <div class="formula-box" style="border-color:rgba(63,185,80,0.4)">
+      <span style="color:var(--text)">dqn_val</span> = J<sub>max</sub> + 0.1 · J<sub>sum</sub><br><br>
+      <span style="color:var(--text)">fatal_penalty</span> = <span class="comment">range_violations × 0.2 × dqn_val</span><br>
+      &nbsp;&nbsp;<span class="comment">// 每架超150km的UAV扣20%dqn_val</span><br><br>
+      <span style="color:var(--text)">abandon_penalty</span> = <span class="comment">Σ abandoned[i].weight × 5000</span><br><br>
+      <span style="color:var(--accent);font-weight:600">r_term</span> = <span class="comment">(baseline_val − dqn_val − fatal_penalty − abandon_penalty)</span><br>
+      &nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;/ <span class="comment">max(baseline_val, 1.0)</span><br><br>
+      <span class="comment">→ DQN优于baseline → reward &gt; 0</span><br>
+      <span class="comment">→ 越限或放弃过多 → heavy penalty → reward &lt; 0</span>
+    </div>
+  </div>
+</div>
+
+<div class="highlight-box" style="margin-top:16px">
+  <strong style="color:var(--cyan)">设计思想:</strong>
+  中间步骤提供<b>即时学习信号</b>（增量代价 + 航程压力），保留 <b>MDP 长期规划能力</b>（done=False）。
+  终端步骤提供<b>全局评价</b>（vs baseline + 越限惩罚），确保 DQN 追求整体最优而非贪心。
+  两段式奖励避免了将 MDP 退化为 Contextual Bandit 的问题。
+</div>
+
+<!-- ==================== 5. Action Space ==================== -->
+<div class="two-col">
+  <div>
+    <div class="section-title"><span class="num">04</span> Action Space <span style="font-weight:400;color:var(--cyan);font-size:0.8rem">— v2: 放弃不再被屏蔽</span></div>
+    <div class="formula-box">
+      <table style="width:100%;color:var(--text);font-size:0.78rem">
+        <tr><td style="color:var(--orange);font-weight:600">0</td><td>Abandon (放弃)</td><td style="color:var(--cyan)">v2: 所有场景可用</td></tr>
+        <tr><td style="color:var(--orange);font-weight:600">1</td><td>Assign → UAV 1</td><td></td></tr>
+        <tr><td style="color:var(--orange);font-weight:600">2</td><td>Assign → UAV 2</td><td></td></tr>
+        <tr><td style="color:var(--orange);font-weight:600">3</td><td>Assign → UAV 3</td><td></td></tr>
+        <tr><td style="color:var(--orange);font-weight:600">4</td><td>Assign → UAV 4</td><td style="color:var(--muted)">S4: 故障UAV屏蔽</td></tr>
+      </table>
+      <div style="margin-top:8px;font-size:0.7rem;color:var(--muted)">
+        v1: S2/S4 屏蔽 action=0 → DQN 被迫接受所有目标<br>
+        v2: 航程约束下 DQN 可<b>战略放弃</b>低权重目标以节省航程
+      </div>
+    </div>
+  </div>
+  <div>
+    <div class="section-title"><span class="num">05</span> Range Constraint</div>
+    <div class="formula-box">
+      <span style="color:var(--cyan);font-weight:600">MAX_RANGE_KM = 150 km</span><br>
+      <span style="color:var(--orange)">SOFT_RANGE_KM = 120 km</span> <span class="comment">(80% · MAX)</span><br><br>
+      <span style="color:var(--text)">range_pressure(k)</span> =<br>
+      &nbsp;&nbsp;<span class="comment">clamp((consumed[k] + extra − 120) / 30, 0, 1)</span><br><br>
+      <span class="comment">// 0 when range_after ≤ 80%MAX</span><br>
+      <span class="comment">// 线性增长到 1.0 at 100%MAX</span><br>
+      <span class="comment">// 超过 150km → fatal (终端处罚)</span>
+    </div>
+  </div>
+</div>
+
+<!-- ==================== 6. State Vector ==================== -->
+<div class="section-title"><span class="num">06</span> State Vector Layout <span style="font-weight:400;color:var(--cyan);font-size:0.85rem">38 dimensions (v2: +4 range ratio)</span></div>
+
+<div style="overflow-x:auto">
+<table class="state-table">
+<thead><tr><th>Idx</th><th>Dim</th><th>Feature</th><th>Normalization</th><th>Module</th></tr></thead>
+<tbody>
+<tr class="section-row"><td colspan="5">UAV Block — 24 dims (v1: 20)</td></tr>
+<tr><td class="dim">0-7</td><td class="val">8</td><td>UAV x, y positions (4 UAVs × 2)</td><td>/ 100</td><td>Position</td></tr>
+<tr><td class="dim">8-11</td><td class="val">4</td><td>UAV active status</td><td>0/1</td><td>Status (S4→0)</td></tr>
+<tr><td class="dim">12-15</td><td class="val">4</td><td>Distance: UAV → current target</td><td>/ 141</td><td>Spatial</td></tr>
+<tr><td class="dim">16-19</td><td class="val">4</td><td>Route load (target count per UAV)</td><td>/ 15</td><td>Workload</td></tr>
+<tr style="background:rgba(57,210,192,0.04)">
+  <td class="dim" style="color:var(--cyan)">20-23</td><td class="new-val">4</td><td style="color:var(--cyan)"><b>UAV range utilization ← NEW v2</b></td><td>/ 150</td><td style="color:var(--cyan)">Range pressure</td>
+</tr>
+<tr class="section-row"><td colspan="5">Target Block — 5 dims</td></tr>
+<tr><td class="dim">24</td><td class="val">1</td><td>Current target x</td><td>/ 100</td><td>Position</td></tr>
+<tr><td class="dim">25</td><td class="val">1</td><td>Current target y</td><td>/ 100</td><td>Position</td></tr>
+<tr><td class="dim">26</td><td class="val">1</td><td>Target weight</td><td>[0,1] raw</td><td>Priority</td></tr>
+<tr><td class="dim">27</td><td class="val">1</td><td>Target radius (km)</td><td>/ 5</td><td>Search cost</td></tr>
+<tr><td class="dim">28</td><td class="val">1</td><td>is_new_target (S2, ID ≥ 100)</td><td>0/1</td><td>Type flag</td></tr>
+<tr class="section-row"><td colspan="5">Emergency Block — 7 dims</td></tr>
+<tr><td class="dim">29-32</td><td class="val">4</td><td>Event type one-hot [S1,S2,S3,S4]</td><td>0/1</td><td>Context</td></tr>
+<tr><td class="dim">33</td><td class="val">1</td><td>No-fly center x (S3 only)</td><td>/ 100</td><td>S3 obstacle</td></tr>
+<tr><td class="dim">34</td><td class="val">1</td><td>No-fly center y (S3 only)</td><td>/ 100</td><td>S3 obstacle</td></tr>
+<tr><td class="dim">35</td><td class="val">1</td><td>No-fly radius (S3 only)</td><td>/ 100</td><td>S3 obstacle</td></tr>
+<tr class="section-row"><td colspan="5">Sequence Block — 2 dims</td></tr>
+<tr><td class="dim">36</td><td class="val">1</td><td>Remaining fraction</td><td>remain/total</td><td>Progress</td></tr>
+<tr><td class="dim">37</td><td class="val">1</td><td>Avg weight of remaining targets</td><td>[0,1] raw</td><td>Lookahead</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="highlight-box" style="margin-top:12px">
+  <strong style="color:var(--cyan)">v2 新增维度说明:</strong>
+  每架UAV的 <code>consumed_ranges[k] / MAX_RANGE_KM</code> 归一化到 [0,1]。
+  DQN 通过这4维感知各UAV的航程余量，在 range_pressure > 0 (超80%) 时倾向于放弃低权重目标或将目标分配给航程充裕的UAV。
+  此信息使得 DQN 可以在 <b>航程耗尽前</b> 做出战略调整，而非事后被 fatal penalty 惩罚。
+</div>
+
+<!-- ==================== 7. DQN Architecture ==================== -->
+<div class="two-col">
+  <div>
+    <div class="section-title"><span class="num">07</span> Dueling DQN Architecture</div>
+    <div class="flow-container" style="padding:20px">
+      <div style="text-align:center;font-family:'IBM Plex Mono',monospace;font-size:0.78rem;line-height:2">
+        <div style="color:var(--muted)">Input (batch, <span style="color:var(--cyan)">38</span>)</div>
+        <div style="margin:4px 0">│</div>
+        <div style="color:var(--accent)">Linear(<span style="color:var(--cyan)">38</span>,128)+ReLU</div>
+        <div>│</div>
+        <div style="color:var(--accent)">Linear(128,128)+ReLU</div>
+        <div>│</div>
+        <div style="color:var(--accent)">Linear(128,128)+ReLU</div>
+        <div style="margin:6px 0;color:var(--muted)">──── shared features ────</div>
+        <div style="display:flex;justify-content:center;gap:40px">
+          <div>
+            <span style="color:var(--green)">V head</span><br>
+            Linear(128,64)+ReLU<br>→ Linear(64,1)<br>
+            <span style="color:var(--green)">V(s)</span>
+          </div>
+          <div>
+            <span style="color:var(--orange)">A head</span><br>
+            Linear(128,64)+ReLU<br>→ Linear(64,5)<br>
+            <span style="color:var(--orange)">A(s,a)</span>
+          </div>
+        </div>
+        <div style="margin:6px 0;color:var(--muted)">Q(s,a) = V(s) + [A(s,a) − mean(A)]</div>
+        <div style="color:var(--accent);font-weight:600">Output (batch, 5)</div>
+      </div>
+    </div>
+  </div>
+  <div>
+    <div class="section-title"><span class="num">08</span> Hyperparameters</div>
+    <div class="flow-container" style="padding:16px 20px;font-size:0.78rem;font-family:'IBM Plex Mono',monospace;line-height:2">
+      <div>lr <span style="color:var(--accent)">1×10⁻⁴</span> <span class="comment">Adam optimizer</span></div>
+      <div>batch <span style="color:var(--accent)">64</span></div>
+      <div>γ <span style="color:var(--accent)">0.95</span> <span class="comment">finite-horizon MDP</span></div>
+      <div>ε <span style="color:var(--accent)">1.0 → 0.01</span> <span class="comment">exponential decay</span></div>
+      <div>target update <span style="color:var(--accent)">1000</span> steps</div>
+      <div>buffer <span style="color:var(--accent)">100k</span> <span class="comment">PER α=0.6, β 0.4→1.0</span></div>
+      <div>save interval <span style="color:var(--accent)">10</span> episodes</div>
+      <div>oracle interval <span style="color:var(--accent)">10</span> episodes</div>
+      <div style="color:var(--cyan)">MAX_RANGE <span style="color:var(--cyan)">150 km</span> <span class="comment">v2 new</span></div>
+      <div style="color:var(--cyan)">SOFT_RANGE <span style="color:var(--cyan)">120 km</span> <span class="comment">v2 new</span></div>
+    </div>
+  </div>
+</div>
+
+<!-- ==================== 9. Complete End-to-End ==================== -->
+<div class="section-title"><span class="num">09</span> End-to-End Episode Pseudocode <span style="font-weight:400;color:var(--cyan);font-size:0.8rem">— v2</span></div>
+
+<div class="flow-container" style="font-size:0.75rem;font-family:'IBM Plex Mono',monospace;line-height:1.8">
+  <div style="margin-bottom:4px;color:var(--muted)"># ── Per Episode (v2) ──</div>
+  <div><span style="color:var(--sim)">emergency</span> = sim.generate_random_emergency(routes)  <span class="comment">S1|S2|S3|S4</span></div>
+  <div><span style="color:var(--sim)">uav_pos, _, completed, remaining, <span style="color:var(--cyan)">consumed_ranges</span></span> = sim.simulate_until_emergency(…)</div>
+  <div><span style="color:var(--orange)">filter</span> emergency.shifts ∉ completed  <span class="comment">S1 only</span></div>
+  <div><span style="color:var(--sim)">hotspots, active</span> = sim.apply_emergency(emergency)</div>
+  <div><span style="color:var(--orange)">affected</span> = get_affected_targets(emergency)  <span class="comment">sorted by weight desc</span></div>
+  <div><span style="color:var(--orange)">affected</span> = filter ∉ completed</div>
+  <div style="margin:6px 0;color:var(--muted)"># ── Decision Loop (v2) ──</div>
+  <div style="color:var(--purple)">for each</span> target ∈ affected:</div>
+  <div style="padding-left:16px">
+    <div><span style="color:var(--orange)">state</span> = build_state_vector(target, pos, active, routes, …, <span style="color:var(--cyan)">consumed_ranges</span>)  <span class="comment" style="color:var(--cyan)">38-dim</span></div>
+    <div><span style="color:var(--dqn)">valid</span> = get_valid_actions(active)  <span class="comment" style="color:var(--cyan)">v2: abandon always available</span></div>
+    <div><span style="color:var(--dqn)">q</span> = dqn.forward(state)  <span class="comment">5 Q-values</span></div>
+    <div><span style="color:var(--dqn)">action</span> = ε-greedy(q, valid)</div>
+    <div>apply_decision(action, target.id, routes, abandoned)</div>
+    <div style="color:var(--cyan)">if not last:</div>
+    <div style="padding-left:12px;color:var(--cyan)">
+      <span>r_step = sim.compute_step_reward(action, target, routes, pos, consumed_ranges, hotspot_map)</span>
+    </div>
+    <div style="padding-left:12px"><span style="color:var(--cyan)">replay_buffer.add(s, a, r_step, next_s, done=False)</span></div>
+  </div>
+  <div style="margin:6px 0;color:var(--muted)"># ── Post-Process ──</div>
+  <div style="padding-left:16px">
+    <div><span style="color:var(--orange)">routes</span> = nearest_neighbor_reorder(routes, positions, hotspot_map)</div>
+    <div><span style="color:var(--orange)">balance_routes</span>(routes, positions, active, hotspot_map)  <span class="comment">spiral_time based</span></div>
+    <div><span style="color:var(--orange)">routes</span> = remove abandoned</div>
+  </div>
+  <div style="margin:6px 0;color:var(--muted)"># ── Cost & Terminal Reward (v2) ──</div>
+  <div style="padding-left:16px">
+    <div><span style="color:var(--sim)">dqn_cost</span> = compute_cost_for_assignment(routes, hotspots, active, emerg, <span style="color:var(--cyan)">consumed_ranges</span>)</div>
+    <div style="color:var(--cyan)">&nbsp;&nbsp;// returns J_max, J_sum, range_violations, max_range_ratio</div>
+    <div><span style="color:var(--sim)">base_cost</span> = compute_cost_for_assignment(baseline_routes, …, <span style="color:var(--cyan)">consumed_ranges</span>)</div>
+    <div><span style="color:var(--sim)">r_term</span> = (base_val − dqn_val − <span style="color:var(--cyan)">fatal_penalty</span> − abandon_penalty) / base_val</div>
+    <div style="color:var(--cyan)">&nbsp;&nbsp;// fatal_penalty = range_violations × 0.2 × dqn_val</div>
+    <div><span style="color:var(--dqn)">replay_buffer.add</span>(s, a, r_term, zeros, <b>done=True</b>)</div>
+  </div>
+  <div style="margin:6px 0;color:var(--muted)"># ── Training ──</div>
+  <div style="padding-left:16px">
+    <div><span style="color:var(--dqn)">batch</span> = replay_buffer.sample(64, β)</div>
+    <div><span style="color:var(--dqn)">loss</span> = SmoothL1(q_action, r + γ·max_next_q·(1−done)) · IS_weights</div>
+    <div>optimizer.step(); replay_buffer.update_priorities(|TD_error|)</div>
+  </div>
+</div>
+
+<!-- ==================== 10. Eval Methods ==================== -->
+<div class="section-title"><span class="num">10</span> Evaluation: 5-Method Comparison <span style="font-weight:400;color:var(--cyan);font-size:0.8rem">— v2: +Rigid Baseline</span></div>
+
+<div class="flow-container" style="font-size:0.75rem;font-family:'IBM Plex Mono',monospace;line-height:1.8">
+  <table style="width:100%;color:var(--text)">
+    <thead><tr style="color:var(--muted);font-size:0.7rem;text-transform:uppercase">
+      <th style="text-align:left;padding:4px 8px">Method</th>
+      <th style="text-align:left;padding:4px 8px">Description</th>
+      <th style="text-align:left;padding:4px 8px">Key Indicator</th>
+    </tr></thead>
+    <tbody>
+    <tr style="color:var(--green)">
+      <td style="padding:6px 8px;font-weight:600">DQN</td>
+      <td style="padding:6px 8px">5-action per-target sequential decision (our agent)</td>
+      <td style="padding:6px 8px">Decision time ~ms</td>
+    </tr>
+    <tr style="color:var(--orange)">
+      <td style="padding:6px 8px;font-weight:600">GA Oracle</td>
+      <td style="padding:6px 8px">Global GA re-optimization after emergency</td>
+      <td style="padding:6px 8px">Theoretical ceiling</td>
+    </tr>
+    <tr style="color:var(--muted)">
+      <td style="padding:6px 8px;font-weight:600">Nearest Neighbor</td>
+      <td style="padding:6px 8px">Each target → closest active UAV (greedy)</td>
+      <td style="padding:6px 8px">Heuristic lower bound</td>
+    </tr>
+    <tr style="color:var(--muted)">
+      <td style="padding:6px 8px;font-weight:600">Greedy Weight</td>
+      <td style="padding:6px 8px">Weight-descending assign to shortest cumulative path UAV</td>
+      <td style="padding:6px 8px">Weight-aware heuristic</td>
+    </tr>
+    <tr style="color:var(--red)">
+      <td style="padding:6px 8px;font-weight:600">Rigid ← NEW v2</td>
+      <td style="padding:6px 8px;font-size:0.7rem">
+        S1: ignore shifts &nbsp;|&nbsp; S3: crash through NFZ &nbsp;|&nbsp; S4: drop tasks<br>
+        No reorder, no rebalance
+      </td>
+      <td style="padding:6px 8px">Lower bound (worst case)</td>
+    </tr>
+    </tbody>
+  </table>
+  <div style="margin-top:12px;font-size:0.7rem;color:var(--muted)">
+    <strong style="color:var(--cyan)">v2 New Metrics:</strong>
+    Fatal% (超150km场景占比) · max_range_ratio (最大航程利用率) · completion_rate · load_balance_index
+  </div>
+</div>
+
+</div>
+</body>
+</html>

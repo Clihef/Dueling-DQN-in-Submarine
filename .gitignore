@@ -1,0 +1,20 @@
+# 虚拟环境
+venv/
+
+# 训练产物
+checkpoints/
+models/
+outputs/
+figure/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# IDE
+.vscode/
+.idea/
+
+# 大文件
+*.gif

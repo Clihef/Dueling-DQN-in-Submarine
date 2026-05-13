@@ -1,0 +1,10 @@
+{
+  "version": "1.0",
+  "suggestions": [
+    {"id":"btw-001","timestamp":"2026-05-11T00:00:00Z","suggestion":"Phase C验证预期效果不满足时，建议提高航程限制","context":{"file":"emergency/simulator.py","pdcaPhase":"do","feature":"emergency-DQN-training"},"category":"improvement","status":"pending","promotedTo":null,"priority":null,"teamContext":{"isTeamSession":false,"phase":"do","role":"user","pattern":null}},
+    {"id":"btw-002","timestamp":"2026-05-11T00:01:00Z","suggestion":"首先考虑增大最大航程约束","context":{"file":"emergency/utils.py","pdcaPhase":"do","feature":"emergency-DQN-training"},"category":"improvement","status":"pending","promotedTo":null,"priority":null,"teamContext":{"isTeamSession":false,"phase":"do","role":"user","pattern":null}},
+    {"id":"btw-003","timestamp":"2026-05-11T00:02:00Z","suggestion":"最大约束改回350km","context":{"file":"emergency/utils.py","pdcaPhase":"do","feature":"emergency-DQN-training"},"category":"improvement","status":"pending","promotedTo":null,"priority":null,"teamContext":{"isTeamSession":false,"phase":"do","role":"user","pattern":null}},
+    {"id":"btw-004","timestamp":"2026-05-11T00:03:00Z","suggestion":"如果冒烟测试效果不好的话，再改回400","context":{"file":"emergency/utils.py","pdcaPhase":"do","feature":"emergency-DQN-training"},"category":"improvement","status":"pending","promotedTo":null,"priority":null,"teamContext":{"isTeamSession":false,"phase":"do","role":"user","pattern":null}}
+  ],
+  "stats":{"total":4,"promoted":0,"dismissed":0,"lastAnalyzed":null}
+}
