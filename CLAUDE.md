@@ -9,24 +9,24 @@ Behavioral guidelines to reduce common LLM coding mistakes.
 ## 1. 项目架构
 
 ```
-core/          # 底层库 (不常改): heatmap, ga_allocator, spiral_search, dubins_planner, uav_navi
-emergency/     # 主工作区: agent, simulator, utils, train, eval, demo, plot_training
-docs/          # 文档区
+core/                    # 核心算法 (不常改): heatmap, ga_allocator, spiral_search, dubins_planner, uav_navi
+emergency/               # DQN 库: agent, simulator, utils
+scripts/                 # 入口脚本: main, train, demo, eval, plot_training
+docs/                    # 文档: architecture/, design/, changelog/
+outputs/                 # 产物: models/, checkpoints/, figures/, eval/
 ```
-
-**多步 MDP**: n 个受影响目标 → n 步序列决策。前 n-1 步 `done=False` (中间即时奖励), 第 n 步 `done=True` (终端全局奖励)。
 
 ## 2. 常用命令
 
 ```bash
-venv/Scripts/python -m emergency.train --episodes 100000          # 从头训练
-venv/Scripts/python -m emergency.train --episodes 100000 --resume auto  # 续训
-venv/Scripts/python -m emergency.demo --type S1                   # 单场景演示 (S1/S2/S3/S4/random)
-venv/Scripts/python -m emergency.eval --scenarios 100             # 5方法对比评估
-venv/Scripts/python -m emergency.plot_training                    # 训练曲线
+venv/Scripts/python scripts/train.py --episodes 100000          # 从头训练
+venv/Scripts/python scripts/train.py --episodes 100000 --resume auto  # 续训
+venv/Scripts/python scripts/demo.py --type S1                   # 单场景演示
+venv/Scripts/python scripts/eval.py --scenarios 100             # 5方法对比评估
+venv/Scripts/python scripts/plot_training.py                    # 训练曲线
 ```
 
-产物: `models/*.pt`, `checkpoints/*.pt`, `models/*_log.csv`, `outputs/emergency_demo_*.png`, `outputs/emergency_eval_*.png`
+产物: `outputs/models/*.pt`, `outputs/checkpoints/*.pt`, `outputs/models/*_log.csv`
 
 ## 3. Think Before Coding
 

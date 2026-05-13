@@ -1,6 +1,6 @@
 """
 训练指标可视化 — 学术风格科研绘图
-用法: python -m emergency.plot_training [--csv models/emergency_dqn_model_log.csv]
+用法: python -m emergency.plot_training [--csv outputs/models/emergency_dqn_model_log.csv]
 """
 import os
 import sys
@@ -11,7 +11,6 @@ import pandas as pd
 import matplotlib
 matplotlib.use('TkAgg')
 import matplotlib.pyplot as plt
-from matplotlib.ticker import ScalarFormatter
 from scipy.ndimage import uniform_filter1d
 
 # ==================== 学术配色 ====================
@@ -70,6 +69,8 @@ def plot_all(csv_path, output_dir='outputs'):
 
     # 只保留 loss>0 的数据用于loss曲线
     df_train = df[df['loss'] > 0].copy()
+
+    max_ep = df['episode'].max()
     total_eps = len(df)
 
     # ==================== Figure 1: Reward + Loss + Epsilon + Steps ====================
@@ -105,15 +106,16 @@ def plot_all(csv_path, output_dir='outputs'):
     ax_e.set_title('(c) Exploration Rate ($\\varepsilon$)')
     ax_e.set_ylim(0, 1.05)
 
-    # --- Steps per episode ---
-    ax_s.plot(df['episode'], df['steps'], color=COLORS['grey'], alpha=0.2, lw=0.5)
-    ax_s.plot(df['episode'], smooth(df['steps']), color=COLORS['purple'], lw=1.5)
-    ax_s.set_ylabel('Affected Targets')
-    ax_s.set_xlabel('Episode')
-    ax_s.set_title('(d) Decisions per Episode')
-    ax_s.set_yticks([1, 2, 3, 4])
+    # --- 替换为 Coverage Ratio (目标覆盖率) ---
+    if 'coverage' in df.columns:
+        ax_s.plot(df['episode'], df['coverage'], color=COLORS['grey'], alpha=0.15, lw=0.5)
+        ax_s.plot(df['episode'], smooth(df['coverage']), color=COLORS['blue'], lw=1.5)
+        ax_s.set_ylabel('Coverage Ratio')
+        ax_s.set_xlabel('Episode')
+        ax_s.set_title('(d) Target Coverage Rate')
+        ax_s.set_ylim(0, 1.05)
 
-    fig.suptitle(f'DQN Training Metrics ($n={total_eps}$ episodes)', fontsize=14,
+    fig.suptitle(f'DQN Training Metrics ($n={max_ep}$ episodes)', fontsize=14,
                  fontweight='bold', y=1.01)
     plt.tight_layout()
     path = os.path.join(output_dir, 'training_metrics.png')
@@ -138,7 +140,7 @@ def plot_all(csv_path, output_dir='outputs'):
     ax_js.set_title('(b) Total Flight Time')
     ax_js.ticklabel_format(axis='y', style='scientific', scilimits=(0, 0))
 
-    fig.suptitle(f'Mission Cost Evolution ($n={total_eps}$ episodes)', fontsize=14,
+    fig.suptitle(f'Mission Cost Evolution ($n={max_ep}$ episodes)', fontsize=14,
                  fontweight='bold', y=1.02)
     plt.tight_layout()
     path = os.path.join(output_dir, 'training_cost.png')
@@ -167,7 +169,7 @@ def plot_all(csv_path, output_dir='outputs'):
     ax_h.set_title('(b) Reward Distribution')
     ax_h.legend()
 
-    fig.suptitle(f'Training Progress Overview ($n={total_eps}$ episodes)', fontsize=14,
+    fig.suptitle(f'Training Progress Overview ($n={max_ep}$ episodes)', fontsize=14,
                  fontweight='bold', y=1.02)
     plt.tight_layout()
     path = os.path.join(output_dir, 'training_overview.png')
@@ -223,7 +225,7 @@ def plot_all(csv_path, output_dir='outputs'):
     lines2, labels2 = ax_ab2.get_legend_handles_labels()
     ax_ab.legend(lines1 + lines2, labels1 + labels2, loc='upper right', fontsize=7)
 
-    fig.suptitle(f'Constraint & Coverage Metrics ($n={total_eps}$ episodes)', fontsize=14,
+    fig.suptitle(f'Constraint & Coverage Metrics ($n={max_ep}$ episodes)', fontsize=14,
                  fontweight='bold', y=1.01)
     plt.tight_layout()
     path = os.path.join(output_dir, 'training_constraints.png')
@@ -232,11 +234,11 @@ def plot_all(csv_path, output_dir='outputs'):
     plt.close(fig)
 
     # ==================== 统计摘要 ====================
-    recent_n = max(100, int(total_eps * 0.2))
-    early_n = max(100, int(total_eps * 0.2))
+    recent_n = max(100, int(max_ep * 0.2))
+    early_n = max(100, int(max_ep * 0.2))
     recent = df.iloc[-recent_n:]
     early = df.iloc[:early_n]
-    print(f'\n统计摘要 (共 {total_eps} 回合):')
+    print(f'\n统计摘要 (共 {max_ep} 回合):')
     print(f'  Reward: 前{early_n}回合均值={early["reward"].mean():+.4f}  '
           f'→ 后{recent_n}回合均值={recent["reward"].mean():+.4f}')
     if len(df_train) > 0:
@@ -260,7 +262,7 @@ def plot_all(csv_path, output_dir='outputs'):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='训练指标可视化')
-    parser.add_argument('--csv', type=str, default='models/emergency_dqn_model_log.csv',
+    parser.add_argument('--csv', type=str, default='outputs/models/emergency_dqn_model_log.csv',
                         help='CSV日志路径')
     parser.add_argument('--output', type=str, default='outputs',
                         help='输出目录')

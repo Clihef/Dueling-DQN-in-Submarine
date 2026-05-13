@@ -1,0 +1,462 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>多无人机突发事件临机决策 — Dueling DQN 项目展示</title>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.css"
+          integrity="sha384-nB0mivkJMXngiE0sVMAOc5DzMxNqmG0ZxBu4oR0FRx3Ue2cxRrZ4kU6pA5Sga7S" crossorigin="anonymous">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link href="https://fonts.googleapis.com/css2?family=Playfair+Display:ital,wght@0,600;0,700;1,600&family=JetBrains+Mono:wght@400;500&family=Noto+Serif+SC:wght@400;600;700&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --bg: #0d1117;
+            --surface: #161b22;
+            --surface-raised: #1c2128;
+            --border: #30363d;
+            --text: #e6edf3;
+            --text-secondary: #8b949e;
+            --accent: #58a6ff;
+            --accent-glow: rgba(88, 166, 255, 0.15);
+            --gold: #d2991d;
+            --red: #f85149;
+            --green: #3fb950;
+            --purple: #a371f7;
+            --radius: 10px;
+        }
+
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+
+        body {
+            font-family: "Noto Serif SC", Georgia, "Times New Roman", serif;
+            background: var(--bg);
+            color: var(--text);
+            line-height: 1.75;
+            background-image:
+                radial-gradient(ellipse at 20% 0%, rgba(88, 166, 255, 0.04) 0%, transparent 50%),
+                radial-gradient(ellipse at 80% 100%, rgba(163, 113, 247, 0.03) 0%, transparent 50%);
+        }
+
+        .hero {
+            position: relative;
+            padding: 80px 24px 64px;
+            text-align: center;
+            background: linear-gradient(180deg, var(--surface-raised) 0%, transparent 100%);
+            border-bottom: 1px solid var(--border);
+            overflow: hidden;
+        }
+        .hero::before {
+            content: "";
+            position: absolute;
+            inset: 0;
+            background: repeating-linear-gradient(
+                0deg, transparent, transparent 2px, rgba(88, 166, 255, 0.015) 2px, rgba(88, 166, 255, 0.015) 4px
+            );
+            pointer-events: none;
+        }
+        .hero-badge {
+            display: inline-block;
+            padding: 4px 14px;
+            border: 1px solid var(--gold);
+            border-radius: 20px;
+            color: var(--gold);
+            font-family: "JetBrains Mono", monospace;
+            font-size: 0.8rem;
+            letter-spacing: 2px;
+            text-transform: uppercase;
+            margin-bottom: 24px;
+        }
+        .hero h1 {
+            font-family: "Playfair Display", "Noto Serif SC", serif;
+            font-size: clamp(2rem, 5vw, 3rem);
+            font-weight: 700;
+            letter-spacing: -0.02em;
+            color: #fff;
+            margin-bottom: 12px;
+            position: relative;
+        }
+        .hero h1::after {
+            content: "";
+            display: block;
+            width: 60px; height: 3px;
+            background: var(--accent);
+            margin: 16px auto 0;
+            border-radius: 2px;
+        }
+        .hero p {
+            color: var(--text-secondary);
+            font-size: 1.05rem;
+            max-width: 640px;
+            margin: 0 auto;
+        }
+
+        .container {
+            max-width: 1000px;
+            margin: 0 auto;
+            padding: 48px 20px 80px;
+        }
+
+        .section {
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: var(--radius);
+            padding: 36px;
+            margin-bottom: 28px;
+            position: relative;
+            transition: border-color 0.3s, box-shadow 0.3s;
+        }
+        .section:hover {
+            border-color: rgba(88, 166, 255, 0.25);
+            box-shadow: 0 0 24px var(--accent-glow);
+        }
+
+        .section-title {
+            font-family: "Playfair Display", "Noto Serif SC", serif;
+            font-size: 1.4rem;
+            font-weight: 600;
+            color: #fff;
+            padding-bottom: 14px;
+            margin-bottom: 24px;
+            border-bottom: 1px solid var(--border);
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+        .section-title .icon {
+            width: 32px; height: 32px;
+            border-radius: 6px;
+            display: flex; align-items: center; justify-content: center;
+            font-size: 0.9rem;
+        }
+        .icon-blue   { background: rgba(88, 166, 255, 0.15); color: var(--accent); }
+        .icon-green  { background: rgba(63, 185, 80, 0.12); color: var(--green); }
+        .icon-purple { background: rgba(163, 113, 247, 0.12); color: var(--purple); }
+        .icon-gold   { background: rgba(210, 153, 29, 0.12); color: var(--gold); }
+
+        h3 {
+            font-family: "Playfair Display", "Noto Serif SC", serif;
+            font-size: 1.15rem;
+            color: var(--accent);
+            margin: 28px 0 12px;
+            font-weight: 600;
+        }
+        h3:first-of-type { margin-top: 0; }
+
+        p { margin-bottom: 14px; color: var(--text-secondary); }
+        strong { color: var(--text); font-weight: 600; }
+
+        .callout {
+            background: var(--surface-raised);
+            border-left: 3px solid var(--accent);
+            padding: 18px 22px;
+            margin: 22px 0;
+            border-radius: 0 var(--radius) var(--radius) 0;
+            font-size: 0.95rem;
+        }
+        .callout.warn  { border-left-color: var(--red); }
+        .callout.good  { border-left-color: var(--green); }
+
+        /* KaTeX overrides */
+        .katex { font-size: 1.05em; }
+        .katex-display { margin: 16px 0; }
+        .math-block {
+            display: block; text-align: center;
+            padding: 16px 0;
+            color: #fff;
+        }
+
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            margin: 20px 0;
+            font-size: 0.92rem;
+        }
+        th, td {
+            padding: 12px 16px;
+            border: 1px solid var(--border);
+            text-align: left;
+        }
+        th {
+            background: var(--surface-raised);
+            color: var(--accent);
+            font-weight: 600;
+            font-family: "JetBrains Mono", monospace;
+            font-size: 0.82rem;
+            letter-spacing: 0.5px;
+            text-transform: uppercase;
+        }
+        tr:nth-child(even) td { background: rgba(255,255,255,0.012); }
+
+        .param-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+            gap: 1px;
+            background: var(--border);
+            border: 1px solid var(--border);
+            border-radius: var(--radius);
+            overflow: hidden;
+        }
+        .param-item {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 14px 18px;
+            background: var(--surface);
+            gap: 12px;
+        }
+        .param-key {
+            font-weight: 600;
+            color: var(--text);
+            font-size: 0.9rem;
+            white-space: nowrap;
+        }
+        .param-value {
+            color: var(--text-secondary);
+            font-family: "JetBrains Mono", monospace;
+            font-size: 0.85rem;
+            text-align: right;
+        }
+
+        .flow-list {
+            list-style: none; padding: 0;
+            display: grid; gap: 10px;
+        }
+        .flow-list li {
+            position: relative;
+            padding: 16px 20px 16px 44px;
+            background: var(--surface-raised);
+            border-radius: var(--radius);
+            border: 1px solid var(--border);
+            font-size: 0.93rem;
+            counter-increment: step;
+        }
+        .flow-list li::before {
+            content: counter(step);
+            position: absolute; left: 12px; top: 14px;
+            width: 24px; height: 24px;
+            border-radius: 50%;
+            background: var(--accent-glow);
+            color: var(--accent);
+            font-family: "JetBrains Mono", monospace;
+            font-size: 0.75rem;
+            display: flex; align-items: center; justify-content: center;
+        }
+
+        .diagram-wrap {
+            display: flex; justify-content: center;
+            margin: 32px 0;
+        }
+
+        code {
+            font-family: "JetBrains Mono", monospace;
+            background: rgba(88, 166, 255, 0.08);
+            color: var(--accent);
+            padding: 2px 7px;
+            border-radius: 4px;
+            font-size: 0.88em;
+        }
+
+        @media (max-width: 640px) {
+            .section { padding: 24px 18px; }
+            .hero { padding: 48px 16px 40px; }
+            .param-grid { grid-template-columns: 1fr; }
+        }
+    </style>
+</head>
+<body>
+
+<div class="hero">
+    <div class="hero-badge">Deep Reinforcement Learning</div>
+    <h1>多无人机突发事件临机决策</h1>
+    <p>基于 Dueling DQN + 优先经验回放 (PER) 的 V2 轮询 MDP 架构，实现 4 机协同搜索的实时动态重规划</p>
+</div>
+
+<div class="container">
+
+<!-- ========== 1. 算法核心架构 ========== -->
+<div class="section">
+    <h2 class="section-title"><span class="icon icon-blue">◆</span> 算法核心架构</h2>
+
+    <h3>1. Dueling DQN（竞争深度 Q 网络）</h3>
+    <p>传统 DQN 直接输出每个动作的 Q 值。而 <strong>Dueling DQN</strong> 将 Q 值评估拆分为两条独立路径：</p>
+    <ul>
+        <li><strong>状态价值头</strong> <span class="katex-inline" id="eq-vs"></span>：评估当前局面的好坏程度。</li>
+        <li><strong>动作优势头</strong> <span class="katex-inline" id="eq-as"></span>：评估选择动作 <span class="katex-inline" id="eq-a"></span> 相对其他动作的额外收益。</li>
+    </ul>
+    <div class="callout">
+        <strong>最终聚合公式：</strong>
+        <div class="math-block">
+            <span id="eq-qformula"></span>
+        </div>
+        这种分离设计使网络在不关心具体动作时（如状态极为优越或极差），能更精准地学习状态本身的价值，极大提高训练稳定性与收敛速度。
+    </div>
+
+    <h3>2. 优先经验回放 (PER)</h3>
+    <p>在复杂约束任务（如绕飞禁飞区）中，包含"教训"或"惊喜"的样本更加珍贵。本项目通过 <strong>二叉线段树</strong> 实现高效 PER：</p>
+    <ul>
+        <li>根据 TD-Error <span class="katex-inline" id="eq-td"></span> 决定采样优先级——误差越大，越需频繁回放。</li>
+        <li>引入重要性采样权重消除分布偏差，参数 <span class="katex-inline" id="eq-beta-per"></span> 从初始值线性退火至 <span class="katex-inline" id="eq-one"></span>，确保训练末期无偏。</li>
+    </ul>
+</div>
+
+<!-- ========== 2. MDP 建模 ========== -->
+<div class="section">
+    <h2 class="section-title"><span class="icon icon-green">◆</span> MDP 建模（116 维状态 · 20 维动作）</h2>
+
+    <h3>1. 状态空间 — 116 维特征矩阵</h3>
+    <table>
+        <tr><th>特征群</th><th>维度</th><th>描述</th></tr>
+        <tr><td>无人机状态矩阵</td><td>12</td><td>4 架 UAV 的 <code>[x, y, range_remaining]</code> 归一化坐标</td></tr>
+        <tr><td>全局目标态势</td><td>100</td>
+            <td>最大 20 个目标槽位，每槽 5 维：<code>[cx, cy, weight, mask, competitive_ratio]</code><br>
+            <em>competitive_ratio</em> = 友机最近距 / 本机距，显式引导网络防抢夺。</td></tr>
+        <tr><td>决策者身份</td><td>4</td><td>当前决策 UAV 的 One-Hot 编码</td></tr>
+    </table>
+
+    <h3>2. 动作空间 — 20 维离散动作</h3>
+    <p>采用以目标为导向的决策：<code>N_MAX = 20</code>。动作 <span class="katex-inline" id="eq-action-range"></span> 代表当前 UAV 选择飞往全局目标池中的对应索引。结合<strong>启发式动作掩码</strong>，物理剔除超限或半途锁定的动作。</p>
+
+    <h3>3. 状态转移</h3>
+    <p>在 <code>apply_action_v2</code> 中，无人机坐标瞬间转移到目标热点 <span class="katex-inline" id="eq-target-pos"></span>，并从剩余航程中严格扣除：</p>
+    <ul>
+        <li>直飞转场距离（含 S3 禁飞区绕飞迂回代价 <span class="katex-inline" id="eq-detour"></span>）</li>
+        <li>目标区域内的螺旋搜索长度（<span class="katex-inline" id="eq-spiral"></span>）</li>
+    </ul>
+    <p>该目标随后被标记为已完成（<code>mask = True</code>）。</p>
+
+    <h3>4. 奖励设计 — 深度解析</h3>
+    <div class="callout">
+        <strong>A. 单步即时奖励</strong>
+        <div class="math-block"><span id="eq-step-reward"></span></div>
+        <ul>
+            <li><strong>目标权重收益：</strong>驱动网络优先飞往高危目标。</li>
+            <li><strong>距离折损：</strong>惩罚舍近求远的行为。</li>
+            <li><strong>抢夺惩罚：</strong>若目标明显位于友机附近（越区抢夺），施加 <span id="eq-steal-penalty"></span> 惩罚，迫使机群学会"礼让"。</li>
+        </ul>
+    </div>
+    <div class="callout good">
+        <strong>B. 回合终止奖励</strong>
+        <ul>
+            <li><strong>完美收官：</strong>所有任务分配完毕，全局通关奖励 <span id="eq-success"></span>。</li>
+            <li><strong>遗漏惩罚：</strong>任务烂尾（坠毁或超限未分配），扣减 <span id="eq-unvisited"></span>。</li>
+        </ul>
+    </div>
+</div>
+
+<!-- ========== 3. 轮询决策循环 ========== -->
+<div class="section">
+    <h2 class="section-title"><span class="icon icon-purple">◆</span> 轮询决策循环逻辑</h2>
+    <p>放弃死板的同步决策，采用自然贴合真实世界时序的 <strong>V2 轮询决策机制</strong>：</p>
+    <ol class="flow-list">
+        <li><strong>环境重置与校验：</strong><code>reset_v2</code> 随机选择存活 UAV，通过 <code>while checked &lt; 4</code> 循环审查其是否拥有合法动作。若无活可干，自动流转至下一架。</li>
+        <li><strong>半途锁定：</strong>若突发事件发生时某 UAV 正在螺旋搜索中途（<code>progress_km &gt; 0</code>），强制生成唯一 Action Mask 锁定当前目标，防止沉没成本浪费。</li>
+        <li><strong>序列化状态推进：</strong>当前 UAV 执行动作后目标被消耗、状态刷新，随后指针 <code>(idx + 1) % 4</code> 流转。</li>
+        <li><strong>阻断误差泄露：</strong>将下一状态的合法动作掩码存入 PER 缓存，在 Bellman 方程中物理阻断非法动作干扰，确保平稳收敛。</li>
+    </ol>
+</div>
+
+<!-- ========== 4. 超参数 ========== -->
+<div class="section">
+    <h2 class="section-title"><span class="icon icon-gold">◆</span> 核心超参数</h2>
+    <div class="param-grid">
+        <div class="param-item"><span class="param-key">总训练回合</span><span class="param-value">80,000</span></div>
+        <div class="param-item"><span class="param-key">批大小</span><span class="param-value">128</span></div>
+        <div class="param-item"><span class="param-key">回放缓存</span><span class="param-value">100,000 条经验</span></div>
+        <div class="param-item"><span class="param-key">学习率</span><span class="param-value">1e-4 (Adam)</span></div>
+        <div class="param-item"><span class="param-key">探索率 ε 衰减</span><span class="param-value">0.9999（~30k 回合至 0.05）</span></div>
+        <div class="param-item"><span class="param-key">PER β 退火周期</span><span class="param-value">40,000 回合至 1.0</span></div>
+        <div class="param-item"><span class="param-key">折扣因子 γ</span><span class="param-value">0.95</span></div>
+    </div>
+</div>
+
+<!-- ========== 5. 网络结构图 ========== -->
+<div class="section">
+    <h2 class="section-title"><span class="icon icon-blue">◆</span> 网络结构图</h2>
+    <p>116 维状态进入 EmergencyDQN 后，分离并重组输出 20 维 Q 值的流动过程：</p>
+    <div class="diagram-wrap">
+        <svg width="800" height="340" viewBox="0 0 800 340" style="max-width:100%;height:auto;font-family:'JetBrains Mono',monospace">
+            <defs>
+                <filter id="glow"><feGaussianBlur stdDeviation="3" result="blur"/><feMerge><feMergeNode in="blur"/><feMergeNode in="SourceGraphic"/></feMerge></filter>
+                <marker id="arr" markerWidth="7" markerHeight="7" refX="6" refY="3.5" orient="auto">
+                    <path d="M0,0 L7,3.5 L0,7 Z" fill="#58a6ff"/>
+                </marker>
+                <linearGradient id="grad-surface" x1="0" y1="0" x2="0" y2="1">
+                    <stop offset="0%" stop-color="#1c2128"/><stop offset="100%" stop-color="#161b22"/>
+                </linearGradient>
+            </defs>
+
+            <!-- Input -->
+            <rect x="16" y="145" width="120" height="50" rx="8" fill="url(#grad-surface)" stroke="#30363d" stroke-width="1.5"/>
+            <text x="76" y="170" fill="#e6edf3" font-size="13" font-weight="600" text-anchor="middle">State (116)</text>
+
+            <path d="M136,170 L186,170" stroke="#58a6ff" stroke-width="2" marker-end="url(#arr)"/>
+
+            <!-- Feature Extractor -->
+            <rect x="196" y="120" width="160" height="100" rx="8" fill="url(#grad-surface)" stroke="#58a6ff" stroke-width="1.5" filter="url(#glow)"/>
+            <text x="276" y="155" fill="#58a6ff" font-size="13" font-weight="600" text-anchor="middle">Shared MLP</text>
+            <text x="276" y="178" fill="#8b949e" font-size="11" text-anchor="middle">128 → 128 → 128</text>
+
+            <!-- Branch paths -->
+            <path d="M356,170 C390,170 390,75 440,85" fill="none" stroke="#58a6ff" stroke-width="1.5" marker-end="url(#arr)"/>
+            <path d="M356,170 C390,170 390,265 440,255" fill="none" stroke="#58a6ff" stroke-width="1.5" marker-end="url(#arr)"/>
+
+            <!-- Value Head -->
+            <rect x="450" y="60" width="160" height="50" rx="8" fill="url(#grad-surface)" stroke="#3fb950" stroke-width="1.5"/>
+            <text x="530" y="85" fill="#3fb950" font-size="13" font-weight="600" text-anchor="middle">V(s)</text>
+            <text x="530" y="140" fill="#8b949e" font-size="10" text-anchor="middle">64 → 1</text>
+
+            <!-- Advantage Head -->
+            <rect x="450" y="230" width="160" height="50" rx="8" fill="url(#grad-surface)" stroke="#d2991d" stroke-width="1.5"/>
+            <text x="530" y="255" fill="#d2991d" font-size="13" font-weight="600" text-anchor="middle">A(s, a)</text>
+            <text x="530" y="305" fill="#8b949e" font-size="10" text-anchor="middle">64 → 20</text>
+
+            <!-- Merge paths -->
+            <path d="M610,85 C640,85 640,170 690,170" fill="none" stroke="#a371f7" stroke-width="1.5" marker-end="url(#arr)"/>
+            <path d="M610,255 C640,255 640,170 690,170" fill="none" stroke="#a371f7" stroke-width="1.5" marker-end="url(#arr)"/>
+
+            <!-- Output -->
+            <rect x="700" y="145" width="84" height="50" rx="8" fill="url(#grad-surface)" stroke="#a371f7" stroke-width="1.5" filter="url(#glow)"/>
+            <text x="742" y="170" fill="#a371f7" font-size="13" font-weight="600" text-anchor="middle">Q(s, a)</text>
+            <text x="742" y="215" fill="#8b949e" font-size="10" text-anchor="middle">dim: 20</text>
+        </svg>
+    </div>
+    <p style="text-align:center;color:var(--text-secondary);font-size:0.88rem">
+        聚合公式：<span id="eq-agg"></span>
+    </p>
+</div>
+
+</div><!-- .container -->
+
+<script src="https://cdn.jsdelivr.net/npm/katex@0.16.11/dist/katex.min.js"
+        crossorigin="anonymous"></script>
+<script>
+function katexSpan(id, formula, displayMode) {
+    var el = document.getElementById(id);
+    if (el) katex.render(formula, el, { displayMode: !!displayMode, throwOnError: false });
+}
+// === Section 1: Architecture ===
+katexSpan("eq-vs", "V(s)", false);
+katexSpan("eq-as", "A(s,a)", false);
+katexSpan("eq-a",  "a", false);
+katexSpan("eq-qformula", "Q(s,a) = V(s) + \\left( A(s,a) - \\frac{1}{|\\mathcal{A}|} \\sum_{a'} A(s,a') \\right)", true);
+katexSpan("eq-td",  "|\\delta_i|", false);
+katexSpan("eq-beta-per", "\\beta", false);
+katexSpan("eq-one", "1.0", false);
+
+// === Section 2: MDP ===
+katexSpan("eq-action-range", "a \\in [0,\\, 19]", false);
+katexSpan("eq-target-pos", "(c_x,\\, c_y)", false);
+katexSpan("eq-detour", "d_{\\text{detour}}", false);
+katexSpan("eq-spiral", "L_{\\text{spiral}}", false);
+
+katexSpan("eq-step-reward",
+    "R_{\\text{step}} = \\alpha \\cdot W_j - \\beta \\cdot \\frac{d}{D_{\\max}} - P_{\\text{steal}}", true);
+katexSpan("eq-steal-penalty", "-0.3 \\cdot W_j", false);
+katexSpan("eq-success", "+10.0", false);
+katexSpan("eq-unvisited", "-5.0 \\cdot \\sum W_{\\text{unvisited}}", false);
+
+// === Section 5: Network ===
+katexSpan("eq-agg", "Q = V + A - \\operatorname{mean}(A)", false);
+</script>
+</body>
+</html>

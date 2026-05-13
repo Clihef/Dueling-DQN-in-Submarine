@@ -2,10 +2,7 @@
 venv/
 
 # 训练产物
-checkpoints/
-models/
 outputs/
-figure/
 
 # Python
 __pycache__/

@@ -1,10 +1,13 @@
+import os
+import sys
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import numpy as np
 import math
 import matplotlib
 matplotlib.use('TkAgg')
 from matplotlib.patches import Circle
 import matplotlib.pyplot as plt
-import matplotlib.cm as cm
+
 from matplotlib.animation import FuncAnimation, PillowWriter
 import os 
 
@@ -756,8 +759,8 @@ def main():
     parser.add_argument(
         '--model-path',
         type=str,
-        default='models/emergency_dqn_model.pt',
-        help='DQN模型路径 (默认 models/emergency_dqn_model.pt)'
+        default='outputs/models/emergency_dqn_model.pt',
+        help='DQN模型路径 (默认 outputs/models/emergency_dqn_model.pt)'
     )
     parser.add_argument(
         '--resume',
@@ -769,7 +772,7 @@ def main():
 
     # ---- 突发事件模式 ----
     if args.emergency_mode == 'train':
-        from emergency.train import train as emergency_train
+        from scripts.train import train as emergency_train
         emergency_train(
             num_episodes=args.emergency_episodes,
             model_save_path=args.model_path,
@@ -778,7 +781,7 @@ def main():
         return
 
     if args.emergency_mode == 'eval':
-        from emergency.eval import evaluate_all_methods
+        from scripts.eval import evaluate_all_methods
         evaluate_all_methods(
             num_scenarios=args.emergency_eval_scenarios,
             model_path=args.model_path,
@@ -786,7 +789,7 @@ def main():
         return
 
     if args.emergency_mode == 'demo':
-        from emergency.demo import run_emergency_demo
+        from scripts.demo import run_emergency_demo
         run_emergency_demo(
             emergency_type=args.emergency_type,
             model_path=args.model_path,
@@ -808,7 +811,7 @@ def main():
     ]
 
     for weights in weight_sets:
-        output_dir = f'outputs/run_{timestamp}/weights_{weights[0]}_{weights[1]}_{weights[2]}'
+        output_dir = f'outputs/figures/run_{timestamp}/weights_{weights[0]}_{weights[1]}_{weights[2]}'
         os.makedirs(output_dir, exist_ok=True)
         run_simulation(
             weights,

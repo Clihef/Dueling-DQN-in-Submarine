@@ -17,9 +17,10 @@ from emergency.utils import (
     NUM_UAVS, SPAN_KM, UAV_V_M_S, UAV_VELOCITY_KM_S,
     MAX_RANGE_KM, SOFT_RANGE_KM,
     compute_detour_distance_km,
-    compute_route_distance_km, GLOBAL_C_DROP, MAX_FLIGHT_TIME_S,
+    GLOBAL_C_DROP,
     N_MAX, ALPHA_REWARD, BETA_REWARD, R_SUCCESS, GAMMA_UNVISITED, MAX_DIAG_KM,
-    build_state_vector_v2, get_valid_actions_v2, apply_action_v2
+    build_state_vector_v2, get_valid_actions_v2, apply_action_v2,
+    _segment_intersects_circle,
 )
 
 
@@ -448,7 +449,7 @@ class EmergencySimulator:
                 if emergency and emergency['type'] == 'S3':
                     nf_cx, nf_cy = emergency['no_fly_center']
                     nf_r = emergency['no_fly_radius']
-                    if self._line_intersects_circle(curr_pos, tgt['center_km'], (nf_cx, nf_cy), nf_r):
+                    if _segment_intersects_circle(curr_pos, tgt['center_km'], nf_cx, nf_cy, nf_r):
                         nfz_violations += 1
                         uav_future_dist += 500.0 # 给局部计算施加巨大物理阻力
                         uav_future_time += 10000.0 
@@ -484,33 +485,6 @@ class EmergencySimulator:
             'nfz_violations': nfz_violations, # 新增
             'max_range_ratio': max_range_ratio,
         }
-
-    @staticmethod
-    def _line_intersects_circle(p1, p2, center, radius):
-        """检查线段是否与圆相交"""
-        cx, cy = center
-        x1, y1 = p1
-        x2, y2 = p2
-        dx = x2 - x1
-        dy = y2 - y1
-        fx = x1 - cx
-        fy = y1 - cy
-
-        a = dx * dx + dy * dy
-        if a < 1e-9:
-            return np.hypot(fx, fy) <= radius
-
-        b = 2 * (fx * dx + fy * dy)
-        c = fx * fx + fy * fy - radius * radius
-        discriminant = b * b - 4 * a * c
-
-        if discriminant < 0:
-            return False
-
-        discriminant = math.sqrt(discriminant)
-        t1 = (-b - discriminant) / (2 * a)
-        t2 = (-b + discriminant) / (2 * a)
-        return (0 <= t1 <= 1) or (0 <= t2 <= 1) or (t1 <= 0 and t2 >= 1)
 
     def compute_oracle_cost(self, remaining_targets, active_uavs,
                             modified_hotspots, weights=(0.5, 0.3, 0.4),
@@ -708,10 +682,12 @@ class EmergencySimulator:
         while checked < 4:
             if self.uav_active[self.current_uav_idx]:
                 # 传入 self.emergency，使校验能够识别 S3 禁飞区的阻力
+                all_locked = [idx for idx in self.locked_target_idxs if idx is not None]
                 valid = get_valid_actions_v2(
                     self.current_uav_idx, self.uav_states, self.targets,
                     locked_target_idx=self.locked_target_idxs[self.current_uav_idx],
-                    emergency=self.emergency
+                    emergency=self.emergency,
+                    all_locked_idxs=all_locked
                 )
                 if valid.any():
                     break # 找到首个能干活的飞机，跳出
@@ -756,10 +732,12 @@ class EmergencySimulator:
                 self.current_uav_idx = (self.current_uav_idx + 1) % 4
                 # 🌟 修复：必须先检查该无人机是否还存活，防止 S4 坠毁飞机复活
                 if self.uav_active[self.current_uav_idx]:
+                    all_locked = [idx for idx in self.locked_target_idxs if idx is not None]
                     valid = get_valid_actions_v2(
                         self.current_uav_idx, self.uav_states, self.targets,
                         locked_target_idx=self.locked_target_idxs[self.current_uav_idx],
-                        emergency=self.emergency
+                        emergency=self.emergency,
+                        all_locked_idxs=all_locked
                     )
                     if valid.any():
                         break

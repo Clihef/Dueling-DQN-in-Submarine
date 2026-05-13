@@ -188,7 +188,8 @@ def uav_navi_traverse(position_target, total_time, time_step, velocity_UAV, erro
     psi0_1 = np.arctan2(dest_y - start_y, dest_x - start_x) % (2 * np.pi)
 
     # 状态初始化
-    x_vector2_1 = np.zeros((5, 1)) # 初始状态向量 [β, p, r, φ, ψ]，假设初始时刻飞机处于平飞状态，偏航角对准第一个航路点
+    x_vector2_1 = np.zeros((5, 1))
+    x_vector2_1[4, 0] = psi0_1  # 核心修复：让飞机初始偏航角直接对准第一段航路
     
     # 记录轨迹的列表
     x_traj = [start_x]

@@ -1,8 +1,7 @@
 """
-基于Dueling DQN的突发事件临机决策智能体
-5个离散动作: 0=放弃, 1-4=指派给UAV1-4
+基于Dueling DQN的突发事件临机决策智能体 (V2 轮询MDP)
+动作空间: N_MAX=20 目标槽位
 参考: Reference/rl/dqn/model.py (PyTorch Dueling DQN)
-      Reference/rl/dqn/replay_buffer.py (Prioritized Experience Replay)
 """
 import random
 import numpy as np
@@ -13,15 +12,14 @@ import torch.nn as nn
 # ==================== 常量 ====================
 
 NUM_UAVS = 4
-NUM_ACTIONS = 5  # 0=放弃, 1-4=指派给UAV1-4
 
 
 # ==================== Dueling DQN 网络 ====================
 
 class EmergencyDQN(nn.Module):
-    """Dueling DQN: 输入38维状态向量，输出5个Q值"""
+    """Dueling DQN: 输入状态向量，输出N_MAX个Q值"""
 
-    def __init__(self, state_dim=96, num_actions=20, hidden_dim=128):
+    def __init__(self, state_dim=116, num_actions=20, hidden_dim=128):
         super().__init__()
         self.num_actions = num_actions
 
@@ -63,7 +61,7 @@ class EmergencyDQN(nn.Module):
         Args:
             state: (batch, state_dim) 状态向量
         Returns:
-            q_values: (batch, 5) 5个动作的Q值 [abandon, UAV1, UAV2, UAV3, UAV4]
+            q_values: (batch, num_actions) Q值
         """
         features = self.feature(state)
         v = self.state_value(features)
@@ -74,34 +72,8 @@ class EmergencyDQN(nn.Module):
 
 # ==================== 动作选择 ====================
 
-def get_valid_actions(active_uavs_mask, _emergency_type=None):
-    """返回当前有效的动作索引列表
-
-    Args:
-        active_uavs_mask: bool[4], True=活跃, False=故障/不可用
-        emergency_type: str, 事件类型（保留兼容，S4屏蔽故障UAV）
-
-    Returns:
-        valid_actions: list of int, 有效动作索引，0=放弃, 1-4=指派给UAV1-4
-    """
-    valid = [0]  # 所有场景下放弃均可用（航程约束下需战略放弃）
-    # UAV1-4对应动作索引1-4
-    for k, active in enumerate(active_uavs_mask):
-        if active:
-            valid.append(k + 1)  # UAV1→1, UAV2→2, ...
-    return valid
-
-
-def select_action(q_values, valid_mask, epsilon=0.0):
+def select_action(q_values: np.ndarray, valid_mask: np.ndarray, epsilon: float = 0.0) -> int:
     """ε-greedy动作选择，带动作屏蔽
-
-    Args:
-        q_values: (num_actions,) numpy array, Q值
-        valid_mask: (num_actions,) bool array, 合法动作掩码
-        epsilon: 探索概率
-
-    Returns:
-        action: int, 动作索引
     """
     if np.random.random() < epsilon:
         return int(np.random.choice(np.where(valid_mask)[0]))
@@ -115,7 +87,7 @@ def select_action(q_values, valid_mask, epsilon=0.0):
 class PrioritizedReplayBuffer:
     """基于二叉线段树的优先经验回放 (PER)"""
 
-    def __init__(self, capacity, alpha=0.6, state_dim=96):
+    def __init__(self, capacity, alpha=0.6, state_dim=116, num_actions=20):
         self.capacity = capacity
         self.alpha = alpha
 
@@ -131,18 +103,20 @@ class PrioritizedReplayBuffer:
             'reward': np.zeros(capacity, dtype=np.float32),
             'next_state': np.zeros((capacity, state_dim), dtype=np.float32),
             'done': np.zeros(capacity, dtype=np.bool_),
+            'next_valid_mask': np.zeros((capacity, num_actions), dtype=np.bool_), # 🌟 新增
         }
         self.next_idx = 0
         self.size = 0
 
-    def add(self, state, action, reward, next_state, done):
+    def add(self, state, action, reward, next_state, done, next_valid_mask):
         idx = self.next_idx
         self.data['state'][idx] = state
         self.data['action'][idx] = action
         self.data['reward'][idx] = reward
         self.data['next_state'][idx] = next_state
         self.data['done'][idx] = done
-
+        if next_valid_mask is not None:
+            self.data['next_valid_mask'][idx] = next_valid_mask # 🌟 存储掩码
         self.next_idx = (idx + 1) % self.capacity
         self.size = min(self.capacity, self.size + 1)
 

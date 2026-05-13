@@ -1,12 +1,9 @@
 """
-DQN突发事件临机决策 — 训练脚本 (多步MDP)
-使用PyTorch + 优先经验回放训练Dueling DQN
-5个离散动作: 0=放弃, 1-4=指派给UAV1-4
+DQN突发事件临机决策 — 训练脚本 (V2 轮询MDP)
 """
 import os
 import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-import time
 import argparse
 import numpy as np
 import torch
@@ -17,13 +14,12 @@ from core import heatmap as hm
 from core import ga_allocator as ga
 from emergency.agent import (
     EmergencyDQN, PrioritizedReplayBuffer,
-    get_valid_actions, select_action, NUM_UAVS, NUM_ACTIONS
+    select_action, NUM_UAVS
 )
 from emergency.simulator import EmergencySimulator
 from emergency.utils import (
-    EmergencyFSM, build_state_vector, get_affected_targets,
-    apply_decision, compute_route_distance_km,
-    STATE_DIM, SPAN_KM, MAX_RANGE_KM, MAX_FLIGHT_TIME_S, GLOBAL_C_DROP,
+    EmergencyFSM, get_affected_targets,
+    SPAN_KM, MAX_RANGE_KM, MAX_FLIGHT_TIME_S, GLOBAL_C_DROP,
     STATE_DIM_V2, N_MAX, get_valid_actions_v2
 )
 
@@ -66,20 +62,20 @@ ORACLE_COMPUTE_INTERVAL = 50  # 每N回合计算一次GA oracle (降低频率加
 
 def _make_ckpt_path(model_save_path, episode):
     model_name = os.path.splitext(os.path.basename(model_save_path))[0]
-    return os.path.join('checkpoints', f'{model_name}_ckpt_ep{episode:06d}.pt')
+    return os.path.join('outputs/checkpoints', f'{model_name}_ckpt_ep{episode:06d}.pt')
 
 
 def find_latest_ckpt(model_save_path):
-    os.makedirs('checkpoints', exist_ok=True)
+    os.makedirs('outputs/checkpoints', exist_ok=True)
     model_name = os.path.splitext(os.path.basename(model_save_path))[0]
     pattern = f'{model_name}_ckpt_ep'
-    candidates = [f for f in os.listdir('checkpoints')
+    candidates = [f for f in os.listdir('outputs/checkpoints')
                   if f.startswith(pattern) and f.endswith('.pt')
                   and '_buffer' not in f]
     if not candidates:
         return None
     candidates.sort(key=lambda x: int(x.replace(pattern, '').replace('.pt', '')))
-    return os.path.join('checkpoints', candidates[-1])
+    return os.path.join('outputs/checkpoints', candidates[-1])
 
 
 def save_checkpoint(ckpt_path, online_net, target_net, optimizer, replay_buffer,
@@ -101,6 +97,7 @@ def save_checkpoint(ckpt_path, online_net, target_net, optimizer, replay_buffer,
                         action=buf.data['action'][:buf.size],
                         reward=buf.data['reward'][:buf.size],
                         next_state=buf.data['next_state'][:buf.size],
+                        next_valid_mask=buf.data['next_valid_mask'][:buf.size], # 🌟 新增这一行：将掩码存入 npz 压缩包 
                         done=buf.data['done'][:buf.size],
                         size=buf.size,
                         next_idx=buf.next_idx,
@@ -128,17 +125,41 @@ def load_checkpoint(ckpt_path, device, buffer_capacity, state_dim=STATE_DIM_V2, 
     if os.path.exists(buf_path):
         buf_data = np.load(buf_path)
         saved_size = int(buf_data['size'])
+
+        # 1. 恢复基础状态数据
         replay_buffer.data['state'][:saved_size] = buf_data['state']
         replay_buffer.data['action'][:saved_size] = buf_data['action']
         replay_buffer.data['reward'][:saved_size] = buf_data['reward']
         replay_buffer.data['next_state'][:saved_size] = buf_data['next_state']
         replay_buffer.data['done'][:saved_size] = buf_data['done']
+
+        # 🌟 新增：安全地恢复掩码（带有向前兼容逻辑）
+        if 'next_valid_mask' in buf_data:
+            replay_buffer.data['next_valid_mask'][:saved_size] = buf_data['next_valid_mask']
+        else:
+            # 向前兼容：如果读取的是上个版本没存 mask 的旧断点，做个全 True 兜底，防止直接报错崩溃
+            print("  注意: 旧断点无 next_valid_mask 数据，使用默认全集初始化")
+            replay_buffer.data['next_valid_mask'][:saved_size] = True
+            
         replay_buffer.size = saved_size
         replay_buffer.next_idx = int(buf_data['next_idx'])
         replay_buffer.max_priority = float(buf_data['max_priority'])
-        replay_buffer.priority_sum = list(buf_data['priority_sum'])
-        replay_buffer.priority_min = list(buf_data['priority_min'])
-        print(f"  回放缓存已恢复: {saved_size} 条样本")
+
+        # 🌟 2. 无损重构优先线段树 (完美兼容 buffer_capacity 的任何改变)
+        saved_sum_tree = buf_data['priority_sum']
+        saved_min_tree = buf_data['priority_min']
+        old_capacity = len(saved_sum_tree) // 2
+        
+        # 提取旧树的真实叶子节点数据
+        old_sum_leaves = saved_sum_tree[old_capacity : old_capacity + saved_size]
+        old_min_leaves = saved_min_tree[old_capacity : old_capacity + saved_size]
+        
+        # 在新树中重新逐个挂载，使其完美适配新的 buffer_capacity
+        for i in range(saved_size):
+            replay_buffer._set_priority_sum(i, old_sum_leaves[i])
+            replay_buffer._set_priority_min(i, old_min_leaves[i])
+            
+        print(f"  回放缓存已无损恢复: {saved_size} 条样本 (已动态适配当前设定容量 {buffer_capacity})")
     else:
         print(f"  警告: 未找到回放缓存文件 {buf_path}, 使用空缓存")
 
@@ -151,7 +172,7 @@ def load_checkpoint(ckpt_path, device, buffer_capacity, state_dim=STATE_DIM_V2, 
 
 def train(num_episodes=500000, batch_size=128, lr=1e-4, gamma=0.95,
           target_update_freq=1000, buffer_capacity=500000,
-          model_save_path='models/emergency_dqn_model.pt',
+          model_save_path='outputs/models/emergency_dqn_model.pt',
           log_interval=100, save_interval=5000,
           resume_path=None, oracle_interval=ORACLE_COMPUTE_INTERVAL):
     """训练DQN智能体 (多步MDP)
@@ -171,8 +192,8 @@ def train(num_episodes=500000, batch_size=128, lr=1e-4, gamma=0.95,
     """
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"使用设备: {device}")
-    print(f"动作空间: 5维 (0=放弃, 1-4=指派给UAV1-4)")
-    print(f"状态空间: {STATE_DIM}维 (逐目标聚焦)")
+    print(f"动作空间: {N_MAX}维 (轮询MDP, N_MAX={N_MAX})")
+    print(f"状态空间: {STATE_DIM_V2}维 (V2 全局目标矩阵)")
 
     # ---- 1. 初始化环境 ----
     print("初始化仿真环境...")
@@ -305,7 +326,7 @@ def train(num_episodes=500000, batch_size=128, lr=1e-4, gamma=0.95,
         step_count = 0
 
     epsilon_min = 0.05
-    # 指数衰减：0.9998^15000 ≈ 0.05，断点续训兼容（基于当前epsilon值衰减，不依赖全局回合数）
+    # 指数衰减：0.9999^30000 ≈ 0.049，断点续训兼容（基于当前epsilon值衰减，不依赖全局回合数），50w回合用0.99999更平滑一些，避免过早衰减到极小值导致训练停滞
     epsilon_decay = 0.9999
     beta_start = 0.4
     beta_end = 1.0
@@ -322,16 +343,22 @@ def train(num_episodes=500000, batch_size=128, lr=1e-4, gamma=0.95,
     best_avg_reward = -float('inf')
     oracle_cost_ema = None  # GA oracle代价的指数移动平均
 
-    # CSV增量日志 (每回合追加，崩溃不丢失)
+    # ========== 修复：CSV增量日志追加逻辑 ==========
     csv_log_path = model_save_path.replace('.pt', '_log.csv')
-    if not loaded_from_ckpt or not os.path.exists(csv_log_path):
+    file_exists = os.path.exists(csv_log_path)
+    
+    # 只有在明确不读取断点，或者文件确实不存在时，才写入表头（清空旧文件）
+    if not loaded_from_ckpt or not file_exists:
         os.makedirs(os.path.dirname(csv_log_path), exist_ok=True)
         with open(csv_log_path, 'w') as f:
             f.write('episode,reward,loss,epsilon,steps,J_max,J_sum,buffer_size,'
                     'range_violations,max_range_ratio,abandoned,'
                     'abandon_avg_w,assign_avg_w,coverage\n')
-    episode_J_max = []
-    episode_J_sum = []
+            
+    # ========== 修复：历史记录数组长度对齐 ==========
+    # 防止断点续训后存入 .npz 时，J_max 和 J_sum 长度跟 rewards 不匹配导致数据损坏
+    episode_J_max = [0.0] * start_episode
+    episode_J_sum = [0.0] * start_episode
     current_loss = 0.0
 
     # id→hotspot 查找表 (用于最近邻重排序)
@@ -354,12 +381,14 @@ def train(num_episodes=500000, batch_size=128, lr=1e-4, gamma=0.95,
                 sim.simulate_until_emergency(ref_paths, emergency,
                                              baseline_routes, route_boundaries_list)
 
-            # S1: 已搜索目标不再位移
+            # S1: 已搜索目标和正在搜索的目标不再发生宏观位移
             if emergency['type'] == 'S1':
                 emergency['shifts'] = [s for s in emergency.get('shifts', [])
-                                       if s['id'] not in completed]
+                                       if s['id'] not in completed 
+                                       and s['id'] not in active_target_ids] # 🌟 加上这半句，彻底落实你的业务逻辑
                 emergency['affected_targets'] = [tid for tid in emergency.get('affected_targets', [])
-                                                  if tid not in completed]
+                                                  if tid not in completed
+                                                  and tid not in active_target_ids] # 🌟 同上
 
             modified_hotspots, active_uavs, _ = sim.apply_emergency(emergency)
 
@@ -400,16 +429,29 @@ def train(num_episodes=500000, batch_size=128, lr=1e-4, gamma=0.95,
             episode_step_reward = 0.0
 
             while not done:
+                # 1. 传入锁定列表防抢夺
+                all_locked = [idx for idx in sim.locked_target_idxs if idx is not None]
                 valid_mask = get_valid_actions_v2(sim.current_uav_idx, sim.uav_states, sim.targets,
                                                   locked_target_idx=sim.locked_target_idxs[sim.current_uav_idx],
-                                                  emergency=emergency)
+                                                  emergency=emergency,
+                                                  all_locked_idxs=all_locked)
                 if not valid_mask.any():
                     break
                 with torch.no_grad():
                     q_vals = online_net(torch.FloatTensor(state).unsqueeze(0).to(device)).squeeze(0).cpu().numpy()
                 action = select_action(q_vals, valid_mask, epsilon)
                 next_state, reward, done, _ = sim.step_v2(action)
-                replay_buffer.add(state, action, reward, next_state, done)
+
+                # 2. 计算并存储 next_valid_mask
+                if not done:
+                    all_locked_next = [idx for idx in sim.locked_target_idxs if idx is not None]
+                    next_valid_mask = get_valid_actions_v2(sim.current_uav_idx, sim.uav_states, sim.targets,
+                                                           locked_target_idx=sim.locked_target_idxs[sim.current_uav_idx],
+                                                           emergency=emergency, all_locked_idxs=all_locked_next)
+                else:
+                    next_valid_mask = np.zeros(N_MAX, dtype=np.bool_)
+
+                replay_buffer.add(state, action, reward, next_state, done, next_valid_mask)
                 state = next_state
                 episode_step_reward += reward
 
@@ -417,8 +459,8 @@ def train(num_episodes=500000, batch_size=128, lr=1e-4, gamma=0.95,
 
             # ========== 训练一步 ==========
             if replay_buffer.size >= batch_size:
-                # PER beta 绝对退火：前300000回合从0.4→1.0，兼容断点续训
-                beta_anneal_episodes = 300000.0
+                # PER beta 绝对退火：前40000回合从0.4→1.0，兼容断点续训
+                beta_anneal_episodes = 40000.0
                 progress = min(1.0, current_episode / beta_anneal_episodes)
                 beta = beta_start + (beta_end - beta_start) * progress
                 samples = replay_buffer.sample(batch_size, beta)
@@ -432,10 +474,19 @@ def train(num_episodes=500000, batch_size=128, lr=1e-4, gamma=0.95,
                 q_values = online_net(states_batch)
                 q_action = q_values.gather(1, actions_batch.unsqueeze(1)).squeeze(1)
 
+                # 3. 🌟 核心修复 4：Bellman 方程只取合法动作的最大值！
+                next_valid_mask_batch = torch.BoolTensor(samples['next_valid_mask']).to(device)
+                
                 with torch.no_grad():
                     next_states_batch = torch.FloatTensor(samples['next_state']).to(device)
                     next_q = target_net(next_states_batch)
+                    
+                    # 屏蔽下一状态的非法动作
+                    next_q = next_q.masked_fill(~next_valid_mask_batch, -float('inf'))
                     max_next_q = next_q.max(dim=1)[0]
+                    # 安全兜底：如果全是非法(done)，置为0
+                    max_next_q[max_next_q == -float('inf')] = 0.0 
+                    
                     target_q = rewards_batch + gamma * max_next_q * (1 - dones_batch)
 
                 td_errors = target_q - q_action
@@ -553,7 +604,7 @@ def train(num_episodes=500000, batch_size=128, lr=1e-4, gamma=0.95,
              losses=episode_losses,
              J_max=episode_J_max,
              J_sum=episode_J_sum)
-    print(f"训练历史已保存: models/training_history.npz")
+    print(f"训练历史已保存: outputs/models/training_history.npz")
     print(f"CSV日志已保存: {csv_log_path}")
 
     return online_net, episode_rewards, episode_losses
@@ -569,10 +620,10 @@ if __name__ == '__main__':
                         help='小批量大小 (默认: 64)')
     parser.add_argument('--lr', type=float, default=1e-4,
                         help='学习率 (默认: 1e-4)')
-    parser.add_argument('--model-path', type=str, default='models/emergency_dqn_model.pt',
+    parser.add_argument('--model-path', type=str, default='outputs/models/emergency_dqn_model.pt',
                         help='模型保存路径')
-    parser.add_argument('--buffer-capacity', type=int, default=500000,
-                        help='回放缓存容量 (默认: 500000)')
+    parser.add_argument('--buffer-capacity', type=int, default=100000,
+                        help='回放缓存容量 (默认: 100000)')
     parser.add_argument('--target-update', type=int, default=1000,
                         help='Target网络更新间隔 (默认: 1000)')
     parser.add_argument('--resume', type=str, default='auto',

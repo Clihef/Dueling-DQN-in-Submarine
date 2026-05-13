@@ -7,9 +7,6 @@ import copy
 
 # ==================== 全局常量 ====================
 NUM_UAVS = 4
-NUM_TARGETS = 15
-MAX_NEW_TARGETS = 3
-STATE_DIM = 38
 SPAN_KM = 100.0
 UAV_V_M_S = 50.0
 UAV_VELOCITY_KM_S = 0.05
@@ -18,7 +15,6 @@ MAX_FLIGHT_TIME_S = MAX_RANGE_KM / UAV_VELOCITY_KM_S # 7000秒
 GLOBAL_C_DROP = 18000.0   # 统一的放弃惩罚
 SOFT_RANGE_KM = 245.0       # 软约束阈值 (70% MAX_RANGE, 350*0.7=245)
 MAX_DIAG_KM = 141.0  # sqrt(100^2 + 100^2)
-MAX_RADIUS_KM = 5.0
 
 # ==================== V2 MDP 常量 ====================
 N_MAX = 20              # 目标槽位上限 (15初始 + 3突发 + 2预留)
@@ -27,129 +23,6 @@ ALPHA_REWARD = 1.0      # 目标权重系数
 BETA_REWARD = 0.8       # 距离惩罚系数（归一化距离 dist/MAX_DIAG_KM），使远距离低权重目标收益为负
 R_SUCCESS = 10.0        # 全局通关奖励
 GAMMA_UNVISITED = 5.0   # 未访问目标权重惩罚系数
-
-
-# ==================== 路由/染色体转换 ====================
-
-def routes_to_chromosome(routes, num_targets, num_uavs):
-    """将路由列表转换为GA染色体格式"""
-    chrom = []
-    separator_val = num_targets
-    for k in range(num_uavs): 
-        if k > 0:
-            chrom.append(separator_val)
-            separator_val += 1
-        chrom.extend(routes[k])
-    return chrom
-
-
-def chromosome_to_routes(chrom, num_targets, num_uavs):
-    """将GA染色体解码为路由列表"""
-    routes = [[] for _ in range(num_uavs)]
-    uav_idx = 0
-    for gene in chrom:
-        if gene >= num_targets:
-            uav_idx += 1
-        else:
-            if uav_idx < num_uavs:
-                routes[uav_idx].append(gene)
-    return routes
-
-
-# ==================== 基于综合代价的贪心插入 ====================
-
-def _cheapest_insertion(target, uav_idx, routes, uav_positions, id_to_hotspot, emergency=None,
-                        consumed_ranges=None, baseline_routes=None, completed=None, UAV_BASE_KM=(0.0, 0.0)):
-    """纯物理距离驱动的贪心插入，保持与评价函数严格一致的螺旋扣减逻辑"""
-    route = routes[uav_idx]
-    if not route:
-        route.append(target['id'])
-        return
-
-    start_pos = uav_positions[uav_idx]
-    best_idx = 0
-    best_cost = float('inf')
-
-    active_target_id = None
-    if baseline_routes and completed is not None and uav_idx < len(baseline_routes):
-        for b_tid in baseline_routes[uav_idx]:
-            if b_tid not in completed:
-                active_target_id = b_tid
-                break
-
-    for i in range(len(route) + 1):
-        temp_route = route[:i] + [target['id']] + route[i:]
-        
-        dist_sum = 0.0
-        curr_pos = start_pos
-        for step_i, tid in enumerate(temp_route):
-            tgt = id_to_hotspot.get(tid)
-            if tgt is None: continue
-            
-            dist = np.hypot(curr_pos[0] - tgt['center_km'][0], curr_pos[1] - tgt['center_km'][1])
-            spiral_km = tgt.get('spiral_dist', tgt.get('spiral_time', 500) * 50.0) / 1000.0
-            actual_dist = dist
-            actual_spiral = spiral_km
-            
-            # 精确打折逻辑
-            if step_i == 0 and tid == active_target_id and consumed_ranges is not None and baseline_routes is not None:
-                comp_targets = []
-                for b_tid in baseline_routes[uav_idx]:
-                    if b_tid == active_target_id:
-                        break
-                    comp_targets.append(b_tid)
-                    
-                comp_spiral_len = sum([id_to_hotspot.get(t, {}).get('spiral_dist', 500*50.0)/1000.0 for t in comp_targets])
-                
-                transit_len = 0.0
-                p = UAV_BASE_KM
-                for t in comp_targets:
-                    pos = id_to_hotspot.get(t, {}).get('center_km', p)
-                    transit_len += np.hypot(pos[0] - p[0], pos[1] - p[1])
-                    p = pos
-                transit_len += np.hypot(tgt['center_km'][0] - p[0], tgt['center_km'][1] - p[1])
-                
-                progress_km = consumed_ranges[uav_idx] - comp_spiral_len - transit_len
-                if progress_km > 0:
-                    actual_spiral = max(0.0, spiral_km - progress_km)
-                    actual_dist = 0.0
-            
-            # 禁飞区硬隔离（确保在分配时避开明显穿越禁区的目标串）
-            if emergency and emergency.get('type') == 'S3':
-                nf_cx, nf_cy = emergency['no_fly_center']
-                nf_r = emergency['no_fly_radius']
-                if _segment_intersects_circle(curr_pos, tgt['center_km'], nf_cx, nf_cy, nf_r):
-                    actual_dist += 500.0 # 插入阶段拒绝穿越
-                    
-            dist_sum += actual_dist + actual_spiral
-            curr_pos = tgt['center_km']
-        
-        if dist_sum < best_cost:
-            best_cost = dist_sum
-            best_idx = i
-            
-    routes[uav_idx].insert(best_idx, target['id'])
-
-def apply_decision(action, target, routes, abandoned_list, uav_positions=None, id_to_hotspot=None, emergency=None,
-                   consumed_ranges=None, baseline_routes=None, completed=None, UAV_BASE_KM=(0.0,0.0)):
-    """
-    执行单步DQN决策，并传入 emergency 用于禁飞区避让
-    """
-    target_id = target['id']
-    if action == 0:
-        abandoned_list.append(target_id)
-    else:
-        uav_idx = action - 1
-        for k in range(len(routes)):
-            if target_id in routes[k]:
-                routes[k].remove(target_id)
-                
-        if uav_positions is not None and id_to_hotspot is not None:
-            # 🌟 透传 emergency
-            _cheapest_insertion(target, uav_idx, routes, uav_positions, id_to_hotspot, emergency=None,
-                        consumed_ranges=None, baseline_routes=None, completed=None, UAV_BASE_KM=(0.0, 0.0))
-        else:
-            routes[uav_idx].append(target_id)
 
 
 # ==================== S3禁飞区绕行 ====================
@@ -261,20 +134,6 @@ def compute_detour_distance_km(p1, p2, cx, cy, r):
     return max(d_detour - d_straight, 0.0)
 
 
-# ==================== 路由负载均衡 ====================
-
-def _uav_load(routes_k, id_to_hotspot):
-    """估算单架UAV的任务负载（螺旋搜索时间，秒）"""
-    total = 0.0
-    for tid in routes_k:
-        h = id_to_hotspot.get(tid)
-        if h and 'spiral_time' in h:
-            total += h['spiral_time']
-        elif h:
-            total += h.get('radius_km', 2.0) * 100.0  # 粗略回退
-    return total
-
-
 # ==================== 航程计算 ====================
 
 def compute_route_distance_km(routes, uav_positions, id_to_hotspot, emergency=None, 
@@ -342,100 +201,6 @@ def compute_route_distance_km(routes, uav_positions, id_to_hotspot, emergency=No
             prev_pos = tgt_pos
         total_distances.append(total)
     return total_distances
-
-# ==================== 状态向量构建 ====================
-
-def build_state_vector(current_target, uav_positions, active_uavs, uav_routes,
-                       affected_targets, processed_count, emergency_info,
-                       consumed_ranges=None):
-    """构建38维状态向量，聚焦当前决策目标
-
-    Args:
-        current_target: dict, 当前决策目标 (含 id, center_km, weight, radius_km)
-        uav_positions: (4, 2) 每架UAV的 (x_km, y_km)
-        active_uavs: bool[4] 哪些UAV活跃
-        uav_routes: list of lists, 每架UAV当前路由 (目标ID列表)
-        affected_targets: list of dict, 所有受影响目标
-        processed_count: int, 已处理目标数
-        emergency_info: dict, 突发事件信息
-        consumed_ranges: list[float]|None, 各UAV已消耗航程(km), None则填0
-
-    Returns:
-        state: (38,) float32 numpy array
-    """
-    state = np.zeros(STATE_DIM, dtype=np.float32)
-    idx = 0
-
-    # --- UAV模块 (4×5=20) ---
-    for k in range(NUM_UAVS):
-        state[idx] = uav_positions[k][0] / SPAN_KM
-        state[idx + 1] = uav_positions[k][1] / SPAN_KM
-        idx += 2
-
-    for k in range(NUM_UAVS):
-        state[idx] = 1.0 if active_uavs[k] else 0.0
-        idx += 1
-
-    tgt_x, tgt_y = current_target['center_km']
-    for k in range(NUM_UAVS):
-        d = np.hypot(uav_positions[k][0] - tgt_x,
-                     uav_positions[k][1] - tgt_y)
-        state[idx] = d / MAX_DIAG_KM
-        idx += 1
-
-    for k in range(NUM_UAVS):
-        state[idx] = min(len(uav_routes[k]) / NUM_TARGETS, 1.0)
-        idx += 1
-
-    # --- UAV航程利用率 (4维) ---
-    ranges = consumed_ranges if consumed_ranges is not None else [0.0] * NUM_UAVS
-    for k in range(NUM_UAVS):
-        state[idx] = min(ranges[k] / MAX_RANGE_KM, 1.0)
-        idx += 1
-
-    # --- 当前目标模块 (5维) ---
-    state[idx] = tgt_x / SPAN_KM
-    idx += 1
-    state[idx] = tgt_y / SPAN_KM
-    idx += 1
-    state[idx] = current_target.get('weight', 0.0)
-    idx += 1
-    state[idx] = current_target.get('radius_km', 2.0) / MAX_RADIUS_KM
-    idx += 1
-    state[idx] = 1.0 if current_target.get('id', 0) >= 100 else 0.0
-    idx += 1
-
-    # --- 突发事件类型 one-hot (4维) ---
-    etype = emergency_info.get('type', 'S1')
-    onehot = {'S1': [1, 0, 0, 0], 'S2': [0, 1, 0, 0],
-              'S3': [0, 0, 1, 0], 'S4': [0, 0, 0, 1]}
-    for v in onehot.get(etype, [0, 0, 0, 0]):
-        state[idx] = float(v)
-        idx += 1
-
-    # --- 禁飞区信息 (3维, 仅S3非零) ---
-    if etype == 'S3':
-        nf_c = emergency_info.get('no_fly_center', (0, 0))
-        state[idx] = nf_c[0] / SPAN_KM
-        state[idx + 1] = nf_c[1] / SPAN_KM
-        state[idx + 2] = emergency_info.get('no_fly_radius', 0) / SPAN_KM
-    idx += 3
-
-    # --- 序列上下文 (2维) ---
-    total_affected = max(len(affected_targets), 1)
-    remaining = total_affected - processed_count
-    state[idx] = remaining / total_affected
-    idx += 1
-
-    if remaining > 0:
-        remaining_targets = affected_targets[processed_count:]
-        avg_w = np.mean([t.get('weight', 0) for t in remaining_targets])
-    else:
-        avg_w = 0.0
-    state[idx] = avg_w
-
-    return state
-
 
 # ==================== 受影响目标提取 ====================
 
@@ -548,8 +313,17 @@ class EmergencyFSM:
 
 # ==================== V2 MDP 函数 ====================
 
-def build_state_vector_v2(uav_states, targets, current_uav_idx):
-    """构建116维全局状态向量 (V2 轮询MDP)"""
+def build_state_vector_v2(uav_states: np.ndarray, targets: list, current_uav_idx: int) -> np.ndarray:
+    """构建116维全局状态向量 (V2 轮询MDP)
+
+    Args:
+        uav_states: (4,3) float32, [x_norm, y_norm, remaining_range_norm]
+        targets: list of dict, 含 id, center_km, weight, spiral_dist, mask
+        current_uav_idx: 当前决策UAV索引 0-3
+
+    Returns:
+        state: (STATE_DIM_V2,) float32
+    """
     state = np.zeros(STATE_DIM_V2, dtype=np.float32)
     state[0:12] = uav_states.flatten()
     ux = uav_states[current_uav_idx][0] * SPAN_KM
@@ -574,8 +348,15 @@ def build_state_vector_v2(uav_states, targets, current_uav_idx):
     return state
 
 
-def get_valid_actions_v2(uav_idx, uav_states, targets, locked_target_idx=None, emergency=None):
-    """返回当前UAV的合法动作掩码 (V2 轮询MDP)"""
+def get_valid_actions_v2(uav_idx: int, uav_states: np.ndarray, targets: list,
+                         locked_target_idx: int | None = None,
+                         emergency: dict | None = None,
+                         all_locked_idxs: list | None = None) -> np.ndarray:
+    """返回当前UAV的合法动作掩码 (V2 轮询MDP)
+
+    Returns:
+        valid_mask: (N_MAX,) bool array
+    """
     if locked_target_idx is not None:
         mask = np.zeros(N_MAX, dtype=np.bool_)
         if locked_target_idx < len(targets) and not targets[locked_target_idx]['mask']:
@@ -590,6 +371,10 @@ def get_valid_actions_v2(uav_idx, uav_states, targets, locked_target_idx=None, e
         t = targets[j]
         if t['mask']:
             continue
+        # 🌟 核心修复 1：禁止抢夺已经被其他兄弟锁定的目标！
+        if all_locked_idxs and j in all_locked_idxs:
+            continue
+        
         cx, cy = t['center_km']
         dist = np.hypot(cx - ux, cy - uy)
         if emergency and emergency.get('type') == 'S3':
@@ -605,8 +390,14 @@ def get_valid_actions_v2(uav_idx, uav_states, targets, locked_target_idx=None, e
     return valid_mask
 
 
-def apply_action_v2(uav_idx, target_idx, uav_states, targets, emergency=None):
-    """执行轮询MDP动作，原地更新状态 (V2)"""
+def apply_action_v2(uav_idx: int, target_idx: int, uav_states: np.ndarray, targets: list,
+                    emergency: dict | None = None) -> tuple[float, float]:
+    """执行轮询MDP动作，原地更新状态 (V2)
+
+    Returns:
+        dist_km: 转场距离 (含S3绕飞)
+        total_cost_km: 转场 + 螺旋搜索总航程
+    """
     t = targets[target_idx]
     cx, cy = t['center_km']
     ux = uav_states[uav_idx][0] * SPAN_KM
@@ -647,22 +438,24 @@ if __name__ == '__main__':
         {'id': 2, 'center_km': (10, 30), 'weight': 0.40, 'radius_km': 2.0},
     ]
 
-    # 1. 状态向量
-    print("--- 状态向量测试 ---")
-    state = build_state_vector(
-        {'id': 0, 'center_km': (15, 15), 'weight': 0.25, 'radius_km': 2.5},
-        np.array([[10, 20], [30, 40], [50, 60], [0, 0]], dtype=float),
-        [True, True, True, True],
-        [[0], [1], [2], []],
-        [{'id': 1, 'center_km': (25, 10), 'weight': 0.30, 'radius_km': 3.0},
-         {'id': 0, 'center_km': (15, 15), 'weight': 0.25, 'radius_km': 2.5}],
-        0,
-        {'type': 'S1', 'severity': 0.5},
-    )
-    assert state.shape[0] == STATE_DIM, f"维度错误: {state.shape[0]} != {STATE_DIM}"
-    print(f"[OK] 状态向量维度: {STATE_DIM}\n")
+    # 1. V2 状态向量
+    print("--- V2 状态向量测试 ---")
+    uav_states = np.array([[0.5, 0.5, 1.0], [0.3, 0.3, 0.8], [0.7, 0.7, 0.9], [0.2, 0.8, 0.7]], dtype=np.float32)
+    targets = [
+        {'id': 0, 'center_km': (15, 15), 'weight': 0.25, 'spiral_dist': 5000.0, 'mask': False},
+        {'id': 1, 'center_km': (25, 10), 'weight': 0.30, 'spiral_dist': 6000.0, 'mask': False},
+    ]
+    state = build_state_vector_v2(uav_states, targets, 0)
+    assert state.shape[0] == STATE_DIM_V2, f"维度错误: {state.shape[0]} != {STATE_DIM_V2}"
+    print(f"[OK] V2 状态向量维度: {STATE_DIM_V2}")
 
-    # 2. FSM
+    # 2. 动作掩码
+    mask = get_valid_actions_v2(0, uav_states, targets)
+    assert mask.shape == (N_MAX,)
+    assert mask[0] and mask[1]
+    print(f"[OK] 动作掩码测试通过")
+
+    # 3. FSM
     print("--- FSM测试 ---")
     fsm = EmergencyFSM()
     assert fsm.is_normal()

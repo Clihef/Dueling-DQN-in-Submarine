@@ -139,7 +139,7 @@ def calc_unified_metrics(routes, sim, modified_hotspots, active_uavs, emergency,
 
 # ==================== 评估主函数 ====================
 
-def evaluate_all_methods(num_scenarios=50, model_path='models/emergency_dqn_model.pt'):
+def evaluate_all_methods(num_scenarios=50, model_path='outputs/models/emergency_dqn_model.pt'):
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"评估设备: {device}")
     
@@ -384,7 +384,7 @@ def evaluate_all_methods(num_scenarios=50, model_path='models/emergency_dqn_mode
         axes[ax_idx].tick_params(axis='x', rotation=20)
         axes[ax_idx].grid(True, linestyle=':', alpha=0.4, axis='y')
     plt.tight_layout()
-    plt.savefig('outputs/emergency_eval_comparison.png', dpi=200)
+    plt.savefig('outputs/eval/emergency_eval_comparison.png', dpi=200)
     plt.close()
 
     # 2. 放弃目标权重分布直方图
@@ -401,15 +401,15 @@ def evaluate_all_methods(num_scenarios=50, model_path='models/emergency_dqn_mode
     ax.legend()
     ax.grid(True, linestyle=':', alpha=0.4, axis='y')
     plt.tight_layout()
-    plt.savefig('outputs/emergency_eval_abandon.png', dpi=200)
+    plt.savefig('outputs/eval/emergency_eval_abandon.png', dpi=200)
     plt.close()
     
-    print("\n✅ 所有学术图表已保存至 outputs/ 目录。")
+    print("\n✅ 所有学术图表已保存至 outputs/eval/ 目录。")
     return results
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--scenarios', type=int, default=50)
-    parser.add_argument('--model-path', type=str, default='models/emergency_dqn_model.pt')
+    parser.add_argument('--model-path', type=str, default='outputs/models/emergency_dqn_model.pt')
     args = parser.parse_args()
     evaluate_all_methods(num_scenarios=args.scenarios, model_path=args.model_path)
