@@ -1,6 +1,5 @@
 import numpy as np
 import matplotlib
-matplotlib.use('TkAgg')
 import matplotlib.pyplot as plt
 import random
 import math
@@ -78,12 +77,18 @@ def calculate_raw_costs(chrom):
     for k, route in enumerate(routes):
         if not route:
             continue
-        curr_pos = UAV_BASE
+        if GA_USE_TRASH and k >= GA_REAL_UAVS:
+            continue
+        if isinstance(UAV_BASE, (list, tuple)) and len(UAV_BASE) > 0 \
+                and isinstance(UAV_BASE[0], (list, tuple, np.ndarray)):
+            curr_pos = UAV_BASE[k]
+        else:
+            curr_pos = UAV_BASE
         t = 0.0
         for tgt_idx in route:
             tgt = TARGETS[tgt_idx]
             # 修改后：直线 + Dubins 转弯惩罚预估
-            linear_dist = np.hypot(curr_pos[0] - tgt['pos'][0], curr_pos[1] - tgt['pos'][1])
+            linear_dist = np.hypot(curr_pos[0] - tgt['pos'][0], curr_pos[1] - tgt['pos'][1]) # type: ignore
 
             # 估算转弯代价：假设平均每次转场需要进行约 90~180 度的偏航角调整
             # 半径 R = 2.0 km，半个圆周的长度大概是 0.75 * pi * R ≈ 4.7 km，飞行时间约 4.7 / 0.05 = 94s，作为转弯惩罚加入总时间
@@ -106,8 +111,12 @@ def calculate_raw_costs(chrom):
     over_time = 0.0
     if GA_D_MAX is not None:
         for k, route in enumerate(real_routes):
-            if finish_times[k] > GA_D_MAX:
-                over_time += finish_times[k] - GA_D_MAX
+            if isinstance(GA_D_MAX, (list, tuple, np.ndarray)):
+                d_max_k = GA_D_MAX[k]
+            else:
+                d_max_k = GA_D_MAX
+            if finish_times[k] > d_max_k:
+                over_time += finish_times[k] - d_max_k
 
     # ---- 放弃惩罚 ----
     abandon_penalty = 0.0
@@ -119,8 +128,8 @@ def calculate_raw_costs(chrom):
 
     return J_max, J_sum, weighted_arrival_sum, routes, finish_times, abandon_penalty, over_time
 
-# ================= 动态归一化代价评估 =================
-def evaluate_chromosome(chrom, norm_factors):
+# ================= 动态归一化代价评估（旧废弃） =================
+def evaluate_chromosome_legacy(chrom, norm_factors):
     """
     代价评估层：接收动态归一化基准，计算最终的适应度代价
     """
@@ -145,6 +154,58 @@ def evaluate_chromosome(chrom, norm_factors):
     return total_cost, routes, finish_times
 
 # ================= 遗传算法 (GA) 操作 =================
+def evaluate_chromosome(chrom, norm_factors):
+    """
+    Evaluate a chromosome with a true lexicographic objective.
+
+    Python compares tuples from left to right, so this encodes the priority
+    directly: range feasibility, coverage count, weighted coverage, then
+    efficiency. This avoids fragile giant scalar weights.
+    """
+    J_max, J_sum, w_arrival, routes, finish_times, abandon_penalty, over_time = calculate_raw_costs(chrom)
+
+    max_J_max, max_J_sum, max_w_arrival, max_abandon, max_over_time = norm_factors
+    _ = (abandon_penalty, max_abandon)
+
+    norm_J_max = J_max / max(max_J_max, 1e-5)
+    norm_J_sum = J_sum / max(max_J_sum, 1e-5)
+    norm_W_arrival = w_arrival / max(max_w_arrival, 1e-5)
+    range_violation_cost = over_time / max(max_over_time, 1e-5)
+
+    trash_route = routes[GA_REAL_UAVS] if GA_USE_TRASH and len(routes) > GA_REAL_UAVS else []
+    abandon_count = len(trash_route)
+    total_target_weight = sum(t.get('weight', 0.0) for t in TARGETS)
+    abandon_weight = sum(TARGETS[t].get('weight', 0.0) for t in trash_route)
+    norm_abandon_count = abandon_count / max(NUM_TARGETS, 1)
+    norm_abandon_weight = abandon_weight / max(total_target_weight, 1e-9)
+
+    efficiency_cost = (W_MAX_TIME * norm_J_max + W_TOTAL_TIME * norm_J_sum
+                       + W_URGENCY * norm_W_arrival)
+
+    objective = (
+        float(range_violation_cost),
+        float(norm_abandon_count),
+        float(norm_abandon_weight),
+        float(efficiency_cost),
+    )
+
+    return objective, routes, finish_times
+
+
+def objective_to_scalar(objective):
+    """Diagnostic scalar for printing/plotting only; GA selection uses the tuple."""
+    if not isinstance(objective, tuple):
+        return float(objective)
+    multipliers = (1_000_000.0, 10_000.0, 100.0, 1.0)
+    return float(sum(value * multipliers[idx] for idx, value in enumerate(objective)))
+
+
+def format_objective(objective):
+    if not isinstance(objective, tuple):
+        return f'{float(objective):.4f}'
+    names = ('range', 'abandon_n', 'abandon_w', 'eff')
+    return ', '.join(f'{name}={value:.4f}' for name, value in zip(names, objective))
+
 def create_individual():
     # 生成一条随机染色体并打乱
     chrom = list(range(NUM_TARGETS + NUM_UAVS - 1)) # 包含目标区域和分隔符
@@ -181,7 +242,8 @@ def mutate(chrom, mutation_rate=0.2):
             chrom[idx1:idx2+1] = list(reversed(chrom[idx1:idx2+1]))
     return chrom
 
-def run_ga(pop_size=100, generations=300, patience=60):
+def _run_ga_scalar_legacy(pop_size=100, generations=300, patience=60):
+    return run_ga(pop_size=pop_size, generations=generations, patience=patience)
     # 种群大小为100，迭代次数为300，如果连续60代没有改进则提前停止
     # 1. 生成第一代随机种群
     population = [create_individual() for _ in range(pop_size)]
@@ -261,6 +323,76 @@ def run_ga(pop_size=100, generations=300, patience=60):
     return best_chrom, best_cost, cost_history, norm_factors
 
 # ================= 可视化 =================
+def run_ga(pop_size=100, generations=300, patience=60):
+    """Run GA using the lexicographic objective from evaluate_chromosome()."""
+    population = [create_individual() for _ in range(pop_size)]
+
+    raw_results = [calculate_raw_costs(chrom) for chrom in population]
+    max_J_max = max(res[0] for res in raw_results)
+    max_J_sum = max(res[1] for res in raw_results)
+    max_w_arrival = max(res[2] for res in raw_results)
+    max_abandon = max(res[5] for res in raw_results) if any(r[5] > 0 for r in raw_results) else 1.0
+    max_over_time = max(res[6] for res in raw_results) if any(r[6] > 0 for r in raw_results) else 1.0
+    norm_factors = (max_J_max, max_J_sum, max_w_arrival, max_abandon, max_over_time)
+
+    print(f"[GA] Norm factors: Max_J_max={max_J_max:.1f}, Max_J_sum={max_J_sum:.1f}, "
+          f"Max_W_arrival={max_w_arrival:.2e}, Max_Abandon={max_abandon:.1f}, "
+          f"Max_OverTime={max_over_time:.1f}s")
+
+    best_chrom = None
+    best_cost = None
+    cost_history = []
+    no_improve_count = 0
+    base_mut_rate = 0.2
+
+    for gen in range(generations):
+        scored_pop = []
+        improved = False
+
+        for chrom in population:
+            cost, _, _ = evaluate_chromosome(chrom, norm_factors)
+            scored_pop.append((cost, chrom))
+            if best_cost is None or cost < best_cost:
+                best_cost = cost
+                best_chrom = chrom
+                improved = True
+
+        if improved:
+            no_improve_count = 0
+        else:
+            no_improve_count += 1
+
+        cost_history.append(objective_to_scalar(best_cost))
+
+        if no_improve_count > 15:
+            current_mut_rate = min(0.6, base_mut_rate + 0.05 * (no_improve_count // 10))
+        else:
+            current_mut_rate = base_mut_rate
+
+        scored_pop.sort(key=lambda x: x[0])
+        next_gen = [x[1] for x in scored_pop[:4]]
+
+        tournament_size = min(5, len(scored_pop))
+        while len(next_gen) < pop_size:
+            p1 = min(random.sample(scored_pop, tournament_size), key=lambda x: x[0])[1]
+            p2 = min(random.sample(scored_pop, tournament_size), key=lambda x: x[0])[1]
+            child = crossover(p1, p2)
+            child = mutate(child, mutation_rate=current_mut_rate)
+            next_gen.append(child)
+
+        population = next_gen
+
+        if gen % 50 == 0:
+            print(f"Generation {gen}, Best Objective: {format_objective(best_cost)}, "
+                  f"Mutation Rate: {current_mut_rate:.2f}")
+
+        if no_improve_count >= patience:
+            print(f"Early stopping at generation {gen} due to no improvement.")
+            break
+
+    return best_chrom, best_cost, cost_history, norm_factors
+
+
 def plot_results(routes, finish_times, cost_history):
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 7))
     

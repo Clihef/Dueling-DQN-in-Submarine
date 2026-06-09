@@ -640,7 +640,7 @@ def run_simulation(weights, output_dir='figure', enable_dynamic_plot=False,
         f.write(f'UAV_V_M_S = {UAV_V_M_S:.3f}\n')
         f.write(f'dx_km = {dx_km:.3f}, span_km = {span_km:.3f}\n')
         f.write(f'spiral_cfg = {spiral_cfg}\n')
-        f.write(f'ga_best_cost = {best_cost:.6f}\n')
+        f.write(f'ga_best_cost = {ga.format_objective(best_cost)}\n')
         f.write(f'ga_norm_factors = {norm_factors}\n')
         f.write(f'ga_real_routes = {real_routes}\n')
         f.write(f'ga_dropped_targets = {dropped_targets}\n\n')  # 🌟 明确记录被放弃的目标
@@ -740,7 +740,7 @@ def main():
     )
     parser.add_argument(
         '--emergency-type',
-        choices=['S1', 'S2', 'S3', 'S4', 'random'],
+        choices=['S1', 'S2', 'S3', 'S4', 'random', 'all'],
         default='random',
         help='突发事件类型 (demo模式, 默认random)'
     )
@@ -763,6 +763,52 @@ def main():
         help='DQN模型路径 (默认 outputs/models/emergency_dqn_model.pt)'
     )
     parser.add_argument(
+        '--emergency-eval-scenarios-per-type',
+        type=int,
+        default=None,
+        help='每类突发事件评估场景数；优先级高于 --emergency-eval-scenarios'
+    )
+    parser.add_argument(
+        '--emergency-eval-seed',
+        type=int,
+        default=42,
+        help='eval模式随机种子 (默认42)'
+    )
+    parser.add_argument(
+        '--emergency-eval-output-dir',
+        type=str,
+        default='outputs/eval',
+        help='eval模式输出目录 (默认 outputs/eval)'
+    )
+    parser.add_argument(
+        '--emergency-eval-ga-pop',
+        type=int,
+        default=160,
+        help='eval模式GA_Replan种群规模 (默认160)'
+    )
+    parser.add_argument(
+        '--emergency-eval-ga-generations',
+        type=int,
+        default=250,
+        help='eval模式GA_Replan迭代代数 (默认250)'
+    )
+    parser.add_argument(
+        '--emergency-eval-ga-patience',
+        type=int,
+        default=60,
+        help='eval模式GA_Replan早停耐心 (默认60)'
+    )
+    parser.add_argument(
+        '--emergency-eval-no-plots',
+        action='store_true',
+        help='eval模式只输出CSV/JSON，不生成图表'
+    )
+    parser.add_argument(
+        '--demo-no-show',
+        action='store_true',
+        help='demo模式只保存图片，不弹出Matplotlib窗口；批量all时推荐开启'
+    )
+    parser.add_argument(
         '--resume',
         type=str,
         default='auto',
@@ -782,18 +828,38 @@ def main():
 
     if args.emergency_mode == 'eval':
         from scripts.eval import evaluate_all_methods
-        evaluate_all_methods(
-            num_scenarios=args.emergency_eval_scenarios,
+        eval_args = argparse.Namespace(
             model_path=args.model_path,
+            scenarios_per_type=(
+                args.emergency_eval_scenarios_per_type
+                if args.emergency_eval_scenarios_per_type is not None
+                else args.emergency_eval_scenarios
+            ),
+            seed=args.emergency_eval_seed,
+            output_dir=args.emergency_eval_output_dir,
+            ga_pop=args.emergency_eval_ga_pop,
+            ga_generations=args.emergency_eval_ga_generations,
+            ga_patience=args.emergency_eval_ga_patience,
+            no_plots=args.emergency_eval_no_plots,
         )
+        evaluate_all_methods(eval_args)
         return
 
     if args.emergency_mode == 'demo':
         from scripts.demo import run_emergency_demo
-        run_emergency_demo(
-            emergency_type=args.emergency_type,
-            model_path=args.model_path,
-        )
+        if args.emergency_type == 'all':
+            for etype in ['S1', 'S2', 'S3', 'S4']:
+                run_emergency_demo(
+                    emergency_type=etype,
+                    model_path=args.model_path,
+                    show=not args.demo_no_show,
+                )
+        else:
+            run_emergency_demo(
+                emergency_type=args.emergency_type,
+                model_path=args.model_path,
+                show=not args.demo_no_show,
+            )
         return
 
     # ---- 原有仿真流程 ----

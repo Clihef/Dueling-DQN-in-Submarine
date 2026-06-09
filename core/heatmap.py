@@ -1,6 +1,5 @@
 import numpy as np
 import matplotlib
-matplotlib.use('TkAgg')
 import matplotlib.pyplot as plt
 
 def generate_controlled_prob_field(X_km, Y_km, hotspots, beta=2.2, alpha=0.2):

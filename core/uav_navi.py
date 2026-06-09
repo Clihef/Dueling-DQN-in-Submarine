@@ -1,10 +1,9 @@
 import numpy as np
 import scipy.signal as signal
 import matplotlib
-matplotlib.use('TkAgg')
 import matplotlib.pyplot as plt
 
-def uav_navi_traverse(position_target, total_time, time_step, velocity_UAV, erro_radius=70.0):
+def uav_navi_traverse(position_target, total_time, time_step, velocity_UAV, erro_radius=150.0):
     """
     无人机自主导航航路点遍历程序,计算无人机从起点到目标点的导航路径
         
@@ -196,6 +195,7 @@ def uav_navi_traverse(position_target, total_time, time_step, velocity_UAV, erro
     y_traj = [start_y]
     dist_error_list = [0.0]  # 记录横向误差用于计算积分和微分
     
+    closest_dist_to_dest = float('inf')
     NN = int(total_time / time_step)
 
     sum_err = 0.0                  # 积分累加器，替代 sum()
@@ -209,22 +209,37 @@ def uav_navi_traverse(position_target, total_time, time_step, velocity_UAV, erro
         curr_y = y_traj[-1] + air_speed * time_step * np.sin(current_heading)
         
         # 利用向量点乘判断是否已经越过目标点所在的法平面 (防止飞过头后无限折返或飞离)
-        vec_sd = np.array([dest_x - start_x, dest_y - start_y])
-        vec_cd = np.array([dest_x - curr_x, dest_y - curr_y])
-        passed_waypoint = np.dot(vec_sd, vec_cd) < 0
+        vec_sd = np.array([dest_x - start_x, dest_y - start_y], dtype=float)
+        vec_sc = np.array([curr_x - start_x, curr_y - start_y], dtype=float)
+        seg_len2 = float(np.dot(vec_sd, vec_sd))
+        seg_len = np.sqrt(seg_len2)
+        along_progress = np.dot(vec_sc, vec_sd) / seg_len2 if seg_len2 > 1e-9 else 1.0
+        dist_to_dest = np.hypot(curr_x - dest_x, curr_y - dest_y)
+        cross_track = (
+            abs(vec_sd[0] * vec_sc[1] - vec_sd[1] * vec_sc[0]) / seg_len
+            if seg_len > 1e-9 else 0.0
+        )
+        closest_dist_to_dest = min(closest_dist_to_dest, dist_to_dest)
+        reached_waypoint = dist_to_dest < erro_radius
+        pass_radius = max(2.0 * erro_radius, 0.25 * seg_len)
+        passed_waypoint = (
+            along_progress >= 1.0
+            and (cross_track <= pass_radius or closest_dist_to_dest <= 3.0 * erro_radius)
+        )
 
         # 检查是否到达当前目标点
-        if np.sqrt((curr_x - dest_x)**2 + (curr_y - dest_y)**2) < erro_radius or passed_waypoint:
-            start_x = dest_x
-            start_y = dest_y
+        if reached_waypoint or passed_waypoint:
+            x_traj.append(curr_x)
+            y_traj.append(curr_y)
             k_1 += 1
             
             # 如果到达了最后一个点，跳出循环
             if k_1 >= num_waypoints:
-                x_traj.append(curr_x)
-                y_traj.append(curr_y)
                 break
-                
+
+            start_x = curr_x
+            start_y = curr_y
+
             dest_x = p_1[k_1, 0]
             dest_y = p_1[k_1, 1]
             
@@ -235,6 +250,9 @@ def uav_navi_traverse(position_target, total_time, time_step, velocity_UAV, erro
             dist_error_list = [0.0]  # 重置误差列表，保持微分项的正确性
 
         # 计算偏航距离误差 (点到直线的距离)
+            closest_dist_to_dest = float('inf')
+            continue
+
         num1 = abs((dest_y - start_y)*curr_x - (dest_x - start_x)*curr_y + start_y*dest_x - dest_y*start_x)
         den1 = np.sqrt((dest_y - start_y)**2 + (dest_x - start_x)**2)
         dist_err = num1 / den1 if den1 != 0 else 0.0

@@ -1,4 +1,4 @@
-"""
+﻿"""
 突发事件 — 工具函数、状态向量、FSM、路由操作
 从 simulator.py 拆分出来，供 train/eval/demo 使用
 """
@@ -15,6 +15,7 @@ MAX_FLIGHT_TIME_S = MAX_RANGE_KM / UAV_VELOCITY_KM_S # 7000秒
 GLOBAL_C_DROP = 18000.0   # 统一的放弃惩罚
 SOFT_RANGE_KM = 245.0       # 软约束阈值 (70% MAX_RANGE, 350*0.7=245)
 MAX_DIAG_KM = 141.0  # sqrt(100^2 + 100^2)
+UAV_MIN_TURN_RADIUS_KM = 2.0  # 与 spiral_cfg['uav']['Rmin']=2000m 对齐
 
 # ==================== V2 MDP 常量 ====================
 N_MAX = 20              # 目标槽位上限 (15初始 + 3突发 + 2预留)
@@ -58,12 +59,11 @@ def replan_around_no_fly(routes, uav_positions, no_fly_center, no_fly_radius,
             # 检测当前段 (points[-1] → tgt_pos) 是否穿越禁飞区
             if _segment_intersects_circle(points[-1], tgt_pos,
                                           nf_cx, nf_cy, no_fly_radius):
-                # 计算绕行点：在圆心到线段垂线的反方向偏移
-                detour = _compute_detour_waypoint(
+                # 使用切线-圆弧绕行点，而不是单个偏移点
+                detours = compute_detour_waypoints_km(
                     points[-1], tgt_pos, nf_cx, nf_cy, no_fly_radius
                 )
-                if detour is not None:
-                    points.append(detour)
+                points.extend(detours)
             points.append(tgt_pos)
         waypoint_paths.append(points)
 
@@ -110,11 +110,90 @@ def _compute_detour_waypoint(p1, p2, cx, cy, r):
     return (cx + dx_c * scale, cy + dy_c * scale)
 
 
-def compute_detour_distance_km(p1, p2, cx, cy, r):
+def _angle_delta_ccw(a1, a2):
+    return (a2 - a1) % (2.0 * np.pi)
+
+
+def _arc_points(cx, cy, radius, a1, a2, clockwise, n_points=8):
+    if clockwise:
+        delta = -((a1 - a2) % (2.0 * np.pi))
+    else:
+        delta = (a2 - a1) % (2.0 * np.pi)
+    angles = a1 + np.linspace(0.0, delta, n_points)
+    return [(cx + radius * np.cos(a), cy + radius * np.sin(a)) for a in angles]
+
+
+def compute_detour_waypoints_km(
+        p1, p2, cx, cy, r, clearance_factor=1.15,
+        min_turn_radius_km=UAV_MIN_TURN_RADIUS_KM):
+    """Return tangent-arc detour waypoints around a circular no-fly zone.
+
+    The returned list excludes p1 and p2. It contains the first tangent point,
+    several arc samples, and the second tangent point. The circular detour arc
+    radius is constrained by both no-fly clearance and UAV minimum turn radius.
+    An empty list means the straight segment does not intersect the no-fly zone.
+    """
+    if not _segment_intersects_circle(p1, p2, cx, cy, r):
+        return []
+
+    x1, y1 = p1
+    x2, y2 = p2
+    d1 = np.hypot(x1 - cx, y1 - cy)
+    d2 = np.hypot(x2 - cx, y2 - cy)
+    safe_radius = max(r * clearance_factor, min_turn_radius_km)
+    if d1 <= safe_radius + 1e-6 or d2 <= safe_radius + 1e-6:
+        wp = _compute_detour_waypoint(p1, p2, cx, cy, r)
+        return [wp] if wp is not None else []
+
+    radius = safe_radius
+
+    tangent_options = []
+    for point, dist in [(p1, d1), (p2, d2)]:
+        theta = np.arctan2(point[1] - cy, point[0] - cx)
+        alpha = np.arccos(np.clip(radius / dist, -1.0, 1.0))
+        tangent_options.append([theta + alpha, theta - alpha])
+
+    best = None
+    for a1 in tangent_options[0]:
+        t1 = (cx + radius * np.cos(a1), cy + radius * np.sin(a1))
+        for a2 in tangent_options[1]:
+            t2 = (cx + radius * np.cos(a2), cy + radius * np.sin(a2))
+            for clockwise in (False, True):
+                arc_delta = (
+                    (a1 - a2) % (2.0 * np.pi)
+                    if clockwise else _angle_delta_ccw(a1, a2)
+                )
+                total_len = (
+                    np.hypot(t1[0] - x1, t1[1] - y1)
+                    + radius * arc_delta
+                    + np.hypot(x2 - t2[0], y2 - t2[1])
+                )
+                max_arc_step = min(
+                    np.pi / 10.0,
+                    max(np.pi / 180.0, 1.6 * np.arccos(np.clip(r / radius, -1.0, 1.0))),
+                )
+                arc_samples = max(4, int(np.ceil(arc_delta / max_arc_step)) + 1)
+                candidate = (
+                    total_len,
+                    _arc_points(cx, cy, radius, a1, a2, clockwise, arc_samples),
+                )
+                if best is None or candidate[0] < best[0]:
+                    best = candidate
+
+    if best is None:
+        wp = _compute_detour_waypoint(p1, p2, cx, cy, r)
+        return [wp] if wp is not None else []
+    return best[1]
+
+
+def compute_detour_distance_km(
+        p1, p2, cx, cy, r,
+        min_turn_radius_km=UAV_MIN_TURN_RADIUS_KM):
     """计算绕飞禁飞区的实际额外距离 (km)
 
-    通过在圆外插入绕行点，计算 p1→waypoint→p2 的实际路径长度，
-    减去直线距离 p1→p2，得到绕飞额外代价。
+    使用满足最小转弯半径的切线-圆弧近似计算
+    p1→tangent→arc→tangent→p2 的绕飞长度，减去直线距离 p1→p2，
+    得到绕飞额外代价。
 
     Args:
         p1, p2: (x_km, y_km) 航段两端
@@ -125,12 +204,18 @@ def compute_detour_distance_km(p1, p2, cx, cy, r):
     """
     if not _segment_intersects_circle(p1, p2, cx, cy, r):
         return 0.0
-    wp = _compute_detour_waypoint(p1, p2, cx, cy, r)
-    if wp is None:
+    waypoints = compute_detour_waypoints_km(
+        p1, p2, cx, cy, r,
+        min_turn_radius_km=min_turn_radius_km,
+    )
+    if not waypoints:
         return 2.5 * r  # 回退到工程估算
+    pts = [p1] + waypoints + [p2]
     d_straight = np.hypot(p2[0] - p1[0], p2[1] - p1[1])
-    d_detour = np.hypot(wp[0] - p1[0], wp[1] - p1[1]) + \
-               np.hypot(p2[0] - wp[0], p2[1] - wp[1])
+    d_detour = sum(
+        np.hypot(pts[i + 1][0] - pts[i][0], pts[i + 1][1] - pts[i][1])
+        for i in range(len(pts) - 1)
+    )
     return max(d_detour - d_straight, 0.0)
 
 
@@ -234,28 +319,12 @@ def get_affected_targets(emergency, routes, hotspots):
             affected.append(copy.deepcopy(nt))
 
     elif etype == 'S3':
-        nf_cx, nf_cy = emergency.get('no_fly_center', (0,0))
-        nf_r = emergency.get('no_fly_radius', 0)
-        
-        for route in routes:
-            for i in range(len(route) - 1):
-                p1 = id_to_hotspot[route[i]]['center_km']
-                p2 = id_to_hotspot[route[i+1]]['center_km']
-                # 检测到阻断
-                if _segment_intersects_circle(p1, p2, nf_cx, nf_cy, nf_r):
-                    # 将该节点及其之后的所有目标全部剥离重新分配
-                    for tid in route[i:]:
-                        h = id_to_hotspot.get(tid)
-                        if h and h not in affected:
-                            affected.append(copy.deepcopy(h))
-                    break # 跳出当前 route 的检测
-        
-        # 兜底逻辑
-        if not affected:
-            for tid in emergency.get('affected_targets', []):
-                h = id_to_hotspot.get(tid)
-                if h and h not in affected:
-                    affected.append(copy.deepcopy(h))
+        # S3 的 affected_targets 只描述禁飞区影响的航段端点；
+        # 是否保持原路由绕飞由 s3_local_detour_routes 判断，DQN 重分配时仍面对所有未完成目标。
+        for tid in emergency.get('affected_targets', []):
+            h = id_to_hotspot.get(tid)
+            if h and h not in affected:
+                affected.append(copy.deepcopy(h))
 
     elif etype == 'S4':
         for tid in emergency.get('lost_targets', []):
@@ -352,7 +421,8 @@ def get_valid_actions_v2(uav_idx: int, uav_states: np.ndarray, targets: list,
                          locked_target_idx: int | None = None,
                          emergency: dict | None = None,
                          all_locked_idxs: list | None = None) -> np.ndarray:
-    """返回当前UAV的合法动作掩码 (V2 轮询MDP)
+    """
+    返回当前UAV的合法动作掩码 (V2 轮询MDP)
 
     Returns:
         valid_mask: (N_MAX,) bool array
@@ -381,8 +451,6 @@ def get_valid_actions_v2(uav_idx: int, uav_states: np.ndarray, targets: list,
             nf_cx, nf_cy = emergency['no_fly_center']
             nf_r = emergency['no_fly_radius']
             if _segment_intersects_circle((ux, uy), (cx, cy), nf_cx, nf_cy, nf_r):
-                dist += 500.0
-            else:
                 dist += compute_detour_distance_km((ux, uy), (cx, cy), nf_cx, nf_cy, nf_r)
         spiral = t.get('spiral_dist', 0.0) / 1000.0
         if dist + spiral <= remaining_km:
@@ -407,8 +475,6 @@ def apply_action_v2(uav_idx: int, target_idx: int, uav_states: np.ndarray, targe
         nf_cx, nf_cy = emergency['no_fly_center']
         nf_r = emergency['no_fly_radius']
         if _segment_intersects_circle((ux, uy), (cx, cy), nf_cx, nf_cy, nf_r):
-            dist_km += 500.0
-        else:
             dist_km += compute_detour_distance_km((ux, uy), (cx, cy), nf_cx, nf_cy, nf_r)
     spiral = t.get('spiral_dist', 0.0) / 1000.0
     total_cost_km = dist_km + spiral

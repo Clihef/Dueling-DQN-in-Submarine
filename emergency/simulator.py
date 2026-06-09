@@ -1,4 +1,4 @@
-"""
+﻿"""
 突发事件仿真器：场景生成、飞行仿真、代价计算
 支持四种突发事件类型 (S1:热点位移, S2:新热点, S3:禁飞区, S4:无人机故障)
 """
@@ -68,19 +68,94 @@ class EmergencySimulator:
         else:
             return self._generate_s4(routes)
 
-    def _generate_s1(self):
-        """S1: 原有热点位置突变 (1~3个目标)"""
+    def _generate_s1(self, eligible_ids=None, trigger_time_frac=None):
+        """S1: 原有热点位置突变 (1~3个目标)
+
+        eligible_ids is used by eval/demo after the trigger point is known, so
+        already completed targets are not shifted.
+        """
         n_shift = random.randint(1, 3)
-        candidates = [h for h in self.original_hotspots]
+        if eligible_ids is None:
+            candidates = [h for h in self.original_hotspots]
+        else:
+            eligible_ids = set(eligible_ids)
+            candidates = [h for h in self.original_hotspots if h['id'] in eligible_ids]
+        if not candidates:
+            return {
+                'type': 'S1', 'shifts': [],
+                'affected_targets': [], 'severity': 0.0,
+                'trigger_time_frac': (
+                    trigger_time_frac
+                    if trigger_time_frac is not None
+                    else random.uniform(0.3, 0.7)
+                ),
+            }
         selected = random.sample(candidates, min(n_shift, len(candidates)))
+        selected_ids = {tgt['id'] for tgt in selected}
+
+        fixed_regions = [
+            (h['id'], h['center_km'][0], h['center_km'][1], h['radius_km'])
+            for h in self.original_hotspots
+            if h['id'] not in selected_ids
+        ]
+        placed_regions = []
+
+        def overlaps_existing(new_x, new_y, radius):
+            for _, ox, oy, other_radius in fixed_regions + placed_regions:
+                if np.hypot(new_x - ox, new_y - oy) < radius + other_radius:
+                    return True
+            return False
+
+        def sample_nonoverlap_position(tgt, local_retries=250, global_retries=250):
+            cx, cy = tgt['center_km']
+            radius = tgt['radius_km']
+            min_coord = radius
+            max_coord = SPAN_KM - radius
+
+            for _ in range(local_retries):
+                angle = random.uniform(0.0, 2.0 * math.pi)
+                magnitude = random.uniform(5.0, 12.0)
+                new_x = cx + magnitude * math.cos(angle)
+                new_y = cy + magnitude * math.sin(angle)
+                if not (min_coord <= new_x <= max_coord and min_coord <= new_y <= max_coord):
+                    continue
+                if not overlaps_existing(new_x, new_y, radius):
+                    return new_x, new_y
+
+            for _ in range(global_retries):
+                new_x = random.uniform(min_coord, max_coord)
+                new_y = random.uniform(min_coord, max_coord)
+                if np.hypot(new_x - cx, new_y - cy) < 5.0:
+                    continue
+                if not overlaps_existing(new_x, new_y, radius):
+                    return new_x, new_y
+
+            return None
 
         shifts = []
         affected_ids = []
         for tgt in selected:
-            dx = random.uniform(-10, 10)
-            dy = random.uniform(-10, 10)
+            cx, cy = tgt['center_km']
+            sampled_pos = sample_nonoverlap_position(tgt)
+            if sampled_pos is None:
+                continue
+            new_x, new_y = sampled_pos
+            dx = new_x - cx
+            dy = new_y - cy
             shifts.append({'id': tgt['id'], 'dx': dx, 'dy': dy})
             affected_ids.append(tgt['id'])
+            placed_regions.append((tgt['id'], new_x, new_y, tgt['radius_km']))
+
+        if not shifts:
+            return {
+                'type': 'S1', 'shifts': [],
+                'affected_targets': [], 'severity': 0.0,
+                'trigger_time_frac': (
+                    trigger_time_frac
+                    if trigger_time_frac is not None
+                    else random.uniform(0.3, 0.7)
+                ),
+            }
 
         max_shift = max(np.hypot(s['dx'], s['dy']) for s in shifts)
         severity = min(max_shift / 20.0, 1.0)
@@ -88,7 +163,11 @@ class EmergencySimulator:
         return {
             'type': 'S1', 'shifts': shifts,
             'affected_targets': affected_ids, 'severity': severity,
-            'trigger_time_frac': random.uniform(0.3, 0.7),
+            'trigger_time_frac': (
+                trigger_time_frac
+                if trigger_time_frac is not None
+                else random.uniform(0.3, 0.7)
+            ),
         }
 
     def _generate_s2(self, max_retries=50):
@@ -247,6 +326,28 @@ class EmergencySimulator:
 
         return modified, active_uavs, completed_targets
 
+    def s3_local_detour_routes(self, routes, active_uavs, consumed_ranges,
+                               uav_positions=None, emergency=None,
+                               baseline_routes=None, completed=None,
+                               active_target_ids=None, progress_kms=None):
+        """如果 S3 可以通过范围内的本地绕行路线处理，则返回原始路线"""
+        if not emergency or emergency.get('type') != 'S3':
+            return routes, False, None
+
+        repaired_routes = [list(r) for r in routes]
+        cost = self.compute_cost_for_assignment(
+            repaired_routes, self.original_hotspots, active_uavs,
+            emergency=emergency, consumed_ranges=consumed_ranges,
+            uav_positions=uav_positions,
+            baseline_routes=baseline_routes,
+            completed=completed,
+            active_target_ids=active_target_ids,
+            progress_kms=progress_kms,
+        )
+        feasible = cost.get('range_violations', 1) == 0 and cost.get('max_range_ratio', 2.0) <= 1.0
+        return repaired_routes, feasible, cost
+
+
     # ==================== 飞行仿真 ====================
 
     def simulate_until_emergency(self, ref_paths, emergency, baseline_routes=None,
@@ -354,7 +455,8 @@ class EmergencySimulator:
 
     def compute_cost_for_assignment(self, assignment_routes, hotspots, active_uavs,
                                      emergency=None, consumed_ranges=None,
-                                     uav_positions=None, baseline_routes=None, completed=None):
+                                     uav_positions=None, baseline_routes=None, completed=None,
+                                     active_target_ids=None, progress_kms=None):
         """计算给定分配方案的代价，含航程约束校验
 
         Args:
@@ -396,8 +498,9 @@ class EmergencySimulator:
             uav_future_dist = 0.0
             uav_future_time = 0.0
 
-            active_target_id = None
-            if baseline_routes and completed is not None and k < len(baseline_routes):
+            active_target_id = active_target_ids[k] \
+                if active_target_ids is not None and k < len(active_target_ids) else None
+            if active_target_id is None and baseline_routes and completed is not None and k < len(baseline_routes):
                 for b_tid in baseline_routes[k]:
                     if b_tid not in completed:
                         active_target_id = b_tid
@@ -420,26 +523,30 @@ class EmergencySimulator:
 
                 # 🌟 核心修复 1：消除螺旋重叠计算 (Double-Counting)
                 # 如果这是剩余航线的第一个目标，且无人机距离目标非常近（说明正在执行它）
-                if i == 0 and tgt_id == active_target_id and consumed_ranges is not None and baseline_routes is not None:
-                    comp_targets = []
-                    for b_tid in baseline_routes[k]:
-                        if b_tid == active_target_id:
-                            break
-                        comp_targets.append(b_tid)
-                        
-                    comp_spiral_km = sum([id_to_h.get(t, {}).get('spiral_dist', 500*50.0)/1000.0 for t in comp_targets])
-                    
-                    transit_km = 0.0
-                    p = self.uav_base_km
-                    for t in comp_targets:
-                        pos = id_to_h.get(t, {}).get('center_km', p)
-                        transit_km += np.hypot(pos[0] - p[0], pos[1] - p[1])
-                        p = pos
-                    transit_km += np.hypot(tgt['center_km'][0] - p[0], tgt['center_km'][1] - p[1])
-                    
-                    progress_km = base_ranges[k] - comp_spiral_km - transit_km
-                    
-                    if progress_km > 0:
+                if i == 0 and tgt_id == active_target_id:
+                    progress_km = None
+                    if progress_kms is not None and k < len(progress_kms):
+                        progress_km = progress_kms[k]
+                    elif consumed_ranges is not None and baseline_routes is not None:
+                        comp_targets = []
+                        for b_tid in baseline_routes[k]:
+                            if b_tid == active_target_id:
+                                break
+                            comp_targets.append(b_tid)
+
+                        comp_spiral_km = sum([id_to_h.get(t, {}).get('spiral_dist', 500*50.0)/1000.0 for t in comp_targets])
+
+                        transit_km = 0.0
+                        p = self.uav_base_km
+                        for t in comp_targets:
+                            pos = id_to_h.get(t, {}).get('center_km', p)
+                            transit_km += np.hypot(pos[0] - p[0], pos[1] - p[1])
+                            p = pos
+                        transit_km += np.hypot(tgt['center_km'][0] - p[0], tgt['center_km'][1] - p[1])
+
+                        progress_km = base_ranges[k] - comp_spiral_km - transit_km
+
+                    if progress_km is not None and progress_km > 0:
                         progress_ratio = min(1.0, progress_km / max(spiral_km, 1e-5))
                         actual_spiral_km = max(0.0, spiral_km - progress_km)
                         actual_spiral_time = actual_spiral_time * (1.0 - progress_ratio)
@@ -451,17 +558,19 @@ class EmergencySimulator:
                     nf_r = emergency['no_fly_radius']
                     if _segment_intersects_circle(curr_pos, tgt['center_km'], nf_cx, nf_cy, nf_r):
                         nfz_violations += 1
-                        uav_future_dist += 500.0 # 给局部计算施加巨大物理阻力
-                        uav_future_time += 10000.0 
-                    else:
-                        # 只有在边缘情况才应用常规绕飞
-                        detour = compute_detour_distance_km(curr_pos, tgt['center_km'], nf_cx, nf_cy, nf_r)
-                        uav_future_dist += detour
-                        uav_future_time += detour / UAV_VELOCITY_KM_S
+                        actual_dist += compute_detour_distance_km(
+                            curr_pos, tgt['center_km'], nf_cx, nf_cy, nf_r
+                        )
 
-                # 紧急度加权（与 GA 公式对齐）
+                uav_future_dist += actual_dist
+                uav_future_time += actual_dist / UAV_VELOCITY_KM_S
+
+                # 紧急度加权（与 GA 公式对齐）：记录到达目标区域的时间
                 amplified_weight = 10 ** (4 * tgt['weight'])
                 weighted_arrival_sum += uav_future_time * amplified_weight
+
+                uav_future_dist += actual_spiral_km
+                uav_future_time += actual_spiral_time
 
                 curr_pos = tgt['center_km']
 
@@ -481,6 +590,8 @@ class EmergencySimulator:
             'J_max': J_max, 'J_sum': J_sum,
             'weighted_arrival_sum': weighted_arrival_sum,
             'finish_times': finish_times,
+            'route_dists_km': route_dists_km,
+            'total_ranges': np.array(total_ranges),
             'range_violations': range_violations,
             'nfz_violations': nfz_violations, # 新增
             'max_range_ratio': max_range_ratio,
@@ -542,80 +653,15 @@ class EmergencySimulator:
                                                      patience=50)
             J_max, J_sum, w_arrival, _, _, _, _ = ga.calculate_raw_costs(best_chrom)
             return {'J_max': J_max, 'J_sum': J_sum,
-                    'weighted_arrival_sum': w_arrival, 'cost': best_cost}
+                    'weighted_arrival_sum': w_arrival,
+                    'cost': ga.objective_to_scalar(best_cost),
+                    'objective': best_cost}
         except Exception as e:
             print(f"[WARNING] Oracle GA failed: {e}, using fallback")
             return {'J_max': 30000.0, 'J_sum': 120000.0,
                     'weighted_arrival_sum': 3e8, 'cost': 1.0}
 
-    def compute_step_reward(self, action, target, consumed_ranges, actual_extra_km=0.0):
-        """中间步骤即时奖励：基于真实增量物理代价 + 航程pressure"""
-        NORM = 5000.0  # 归一化因子
-
-        if action == 0:
-            # 放弃 → 机会成本
-            return -target.get('weight', 0.3) * 2.0
-
-        uav_idx = action - 1
-        
-        # 直接使用传入的真实增量距离计算时间
-        extra_time = actual_extra_km / UAV_VELOCITY_KM_S
-
-        # 🌟 核心修复: 改用边际压力 (Marginal Pressure)
-        range_before = consumed_ranges[uav_idx]
-        range_after = consumed_ranges[uav_idx] + actual_extra_km
-        
-        p_before = max(0.0, range_before - SOFT_RANGE_KM) / max(MAX_RANGE_KM - SOFT_RANGE_KM, 1.0)
-        p_after = max(0.0, range_after - SOFT_RANGE_KM) / max(MAX_RANGE_KM - SOFT_RANGE_KM, 1.0)
-        
-        marginal_pressure = p_after - p_before
-
-        return -(extra_time / NORM + marginal_pressure * 1.0)
-
-    def compute_reward(self, dqn_cost, oracle_cost=None, baseline_val=None,
-                        abandoned_targets=None):
-        """终端奖励：字典序优先级 (连续梯度版)
-
-        P1a: 航程硬约束 — 越限数量线性惩罚 (-2.0/UAV), 0→安全 4→坠毁
-        P1b: 覆盖优先级 — sum(w) * 5.0, 放弃高权重>>弃低权重
-        P2:  效能寻优 — 0.5*J_max_norm + 0.3*J_sum_norm + 0.4*w_norm
-        """
-        range_violations = dqn_cost.get('range_violations', 0)
-        nfz_violations = dqn_cost.get('nfz_violations', 0)
-
-        # P1a: 增加禁飞区坠毁惩罚 (极其严厉)
-        FATAL_PER_UAV = 4.0
-        fatal_penalty = range_violations * FATAL_PER_UAV + nfz_violations * 20.0
-
-        # P1b: 覆盖优先级
-        COVERAGE_PENALTY = 5.0
-        abandon_penalty = 0.0
-        if abandoned_targets:
-            abandon_penalty = sum(t.get('weight', 0.3) for t in abandoned_targets) * COVERAGE_PENALTY
-
-        # P2: 效能寻优归一化
-        ref_J_max = 10000.0
-        ref_J_sum = 40000.0
-        # 🌟 修复：将其改为固定的经验常数（推荐 5e7 或 1e8），绝对不能使用 dqn_cost 去动态除自己！
-        ref_w = 50000000.0
-
-        if oracle_cost is not None and isinstance(oracle_cost, dict) and oracle_cost.get('J_max', 0) > 0:
-            ref_J_max = max(ref_J_max, oracle_cost['J_max'])
-            ref_J_sum = max(ref_J_sum, oracle_cost['J_sum'])
-            # 如果 GA 给出了更好的（更低的）加权代价，也可以作为基准参考
-            if oracle_cost.get('weighted_arrival_sum', 0) > 0:
-                ref_w = max(ref_w, oracle_cost['weighted_arrival_sum'])
-        elif baseline_val is not None and baseline_val > 0:
-            ref_J_max = max(ref_J_max, baseline_val)
-
-        J_max_norm = dqn_cost['J_max'] / max(ref_J_max, 1.0)
-        J_sum_norm = dqn_cost['J_sum'] / max(ref_J_sum, 1.0)
-        w_norm = dqn_cost.get('weighted_arrival_sum', 0.0) / max(ref_w, 1.0)
-        efficiency_cost = 0.5 * J_max_norm + 0.3 * J_sum_norm + 0.4 * w_norm
-
-        reward = -(fatal_penalty + abandon_penalty + efficiency_cost)
-        return reward
-
+    
     # ==================== V2 轮询MDP接口 ====================
 
     def reset_v2(self, uav_positions_km, consumed_ranges_km, hotspots, active_uavs=None, completed=None,

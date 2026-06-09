@@ -1,17 +1,57 @@
-# 虚拟环境
-venv/
-
-# 训练产物
-outputs/
-
 # Python
 __pycache__/
-*.pyc
+*.py[cod]
 *.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
 
-# IDE
+# Virtual environments
+venv/
+.venv/
+env/
+
+# IDE and local assistant state
 .vscode/
 .idea/
+.bkit/
+.claude/
+.agents/
+.codex/
+AGENTS.md
 
-# 大文件
+# Runtime outputs and trained artifacts
+outputs/
+models/
+*.pt
+*.pth
+*.ckpt
+*.npz
+*.npy
+*.csv
+
+# Generated figures and animations
 *.gif
+*.mp4
+*.avi
+
+# Generated or personal document artifacts
+docs/*.html
+docs/*.pdf
+docs/*.pptx
+docs/*.docx
+docs/changelog/
+docs/clean.md
+docs/reward_bug.md
+docs/simulate_until_.md
+docs/skill.md
+docs/readme.md
+docs/dueling_dqn_polling_flowchart.md
+docs/dueling_dqn_section_plan.md
+docs/result_analysis.md
+
+# OS/editor temporary files
+.DS_Store
+Thumbs.db
+~$*

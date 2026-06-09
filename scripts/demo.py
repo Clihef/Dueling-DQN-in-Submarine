@@ -1,4 +1,4 @@
-"""
+﻿"""
 突发事件临机决策 — 可视化演示 (全物理气动轨迹优化版)
 """
 import os
@@ -22,7 +22,7 @@ from emergency.agent import EmergencyDQN, NUM_UAVS
 from emergency.simulator import EmergencySimulator
 from emergency.utils import (
     get_affected_targets,
-    replan_around_no_fly, compute_route_distance_km,
+    replan_around_no_fly, compute_detour_waypoints_km, compute_route_distance_km,
     SPAN_KM, MAX_RANGE_KM, MAX_FLIGHT_TIME_S, GLOBAL_C_DROP,
     STATE_DIM_V2, N_MAX, get_valid_actions_v2
 )
@@ -62,28 +62,247 @@ spiral_cfg = {
 
 
 # ==================== 辅助：生成动力学航迹 ====================
+def _dedupe_path_m(path_m, min_sep_m=5.0):
+    path_m = np.asarray(path_m, dtype=float)
+    if len(path_m) < 2:
+        return path_m.copy()
+
+    clean_path = [path_m[0]]
+    for pt in path_m[1:]:
+        if np.hypot(pt[0] - clean_path[-1][0], pt[1] - clean_path[-1][1]) > min_sep_m:
+            clean_path.append(pt)
+    return np.asarray(clean_path, dtype=float)
+
+
+def _clip_path_to_demo_bounds_m(path_m, margin_m=200.0):
+    """Clip only the visualized trajectory to the demo map bounds."""
+    path_m = np.asarray(path_m, dtype=float)
+    if len(path_m) == 0:
+        return path_m.copy()
+    lower = float(margin_m)
+    upper = SPAN_KM * 1000.0 - float(margin_m)
+    clipped = path_m.copy()
+    clipped[:, 0] = np.clip(clipped[:, 0], lower, upper)
+    clipped[:, 1] = np.clip(clipped[:, 1], lower, upper)
+    return _dedupe_path_m(clipped, min_sep_m=5.0)
+
+
+def _path_out_of_demo_bounds_m(path_m, margin_m=0.0):
+    path_m = np.asarray(path_m, dtype=float)
+    if len(path_m) == 0:
+        return False
+    lower = float(margin_m)
+    upper = SPAN_KM * 1000.0 - float(margin_m)
+    return bool(
+        np.any(path_m[:, 0] < lower)
+        or np.any(path_m[:, 0] > upper)
+        or np.any(path_m[:, 1] < lower)
+        or np.any(path_m[:, 1] > upper)
+    )
+
+
+def _resample_polyline_m(path_m, step_m=200.0):
+    """Create a stable visual polyline without invoking the low-level tracker."""
+    path_m = np.asarray(path_m, dtype=float)
+    if len(path_m) < 2:
+        return path_m.copy()
+
+    points = [path_m[0]]
+    for p0, p1 in zip(path_m[:-1], path_m[1:]):
+        seg = p1 - p0
+        seg_len = float(np.hypot(seg[0], seg[1]))
+        if seg_len <= 1e-9:
+            continue
+        n = max(1, int(np.ceil(seg_len / step_m)))
+        for j in range(1, n + 1):
+            points.append(p0 + (j / n) * seg)
+    return np.asarray(points, dtype=float)
+
+
+def _visual_reference_traj_m(ref_path_m):
+    bounded_ref = _clip_path_to_demo_bounds_m(ref_path_m)
+    return _resample_polyline_m(bounded_ref, step_m=200.0)
+
+
+def fill_feasible_baseline_abandoned_targets(sim, routes, hotspots):
+    """Deterministically insert GA-abandoned targets when range-feasible.
+
+    The GA chromosome has an abandon bucket. For demo baseline visualization we
+    want a coverage-first initial plan, so any target that can be inserted
+    without violating the range constraint is restored after GA search.
+    """
+    routes = [list(route) for route in routes]
+    target_ids = {int(h['id']) for h in hotspots}
+    weights = {int(h['id']): float(h.get('weight', 0.0)) for h in hotspots}
+    active_uavs = [True] * NUM_UAVS
+    consumed_ranges = [0.0] * NUM_UAVS
+    uav_positions = [UAV_BASE_KM] * NUM_UAVS
+    inserted = []
+
+    def route_cost(candidate_routes):
+        return sim.compute_cost_for_assignment(
+            candidate_routes,
+            hotspots,
+            active_uavs,
+            consumed_ranges=consumed_ranges,
+            uav_positions=uav_positions,
+        )
+
+    while True:
+        assigned = {int(tid) for route in routes for tid in route}
+        abandoned = sorted(
+            target_ids - assigned,
+            key=lambda tid: weights.get(tid, 0.0),
+            reverse=True,
+        )
+        if not abandoned:
+            return routes, inserted
+
+        best_insert = None
+        for target_id in abandoned:
+            for uav_idx in range(NUM_UAVS):
+                for pos in range(len(routes[uav_idx]) + 1):
+                    trial = [list(route) for route in routes]
+                    trial[uav_idx].insert(pos, int(target_id))
+                    cost = route_cost(trial)
+                    if int(cost.get('range_violations', 0)) != 0:
+                        continue
+                    if float(cost.get('max_range_ratio', 2.0)) > 1.0:
+                        continue
+                    total_ranges = np.asarray(cost.get('total_ranges', np.zeros(NUM_UAVS)), dtype=float)
+                    candidate = (
+                        -weights.get(target_id, 0.0),
+                        float(cost.get('J_max', 0.0)),
+                        float(cost.get('J_sum', 0.0)),
+                        float(np.max(total_ranges)) if total_ranges.size else 0.0,
+                        target_id,
+                        trial,
+                    )
+                    if best_insert is None or candidate < best_insert:
+                        best_insert = candidate
+
+        if best_insert is None:
+            return routes, inserted
+
+        _, _, _, _, target_id, routes = best_insert
+        inserted.append(int(target_id))
+
+
 def generate_aero_traj(ref_path_m, v_uav):
-    """提取稀疏参考点，传入动力学模型解算实际飞行轨迹"""
+    """提取稀疏参考点，传入动力学模型解算实际飞行轨迹。
+
+    This function is used only for demo visualization. If the aerodynamic
+    tracker creates a visibly invalid path (out of map bounds or truncated), we
+    fall back to a bounded reference trajectory so the figure reflects the
+    planned route order without visual artifacts.
+    """
     if len(ref_path_m) < 2:
         return np.empty((0, 2))
-    
-    clean_path = [ref_path_m[0]]
-    for pt in ref_path_m[1:]:
-        if np.hypot(pt[0] - clean_path[-1][0], pt[1] - clean_path[-1][1]) > 5.0:
-            clean_path.append(pt)
-    ref_path_clean = np.array(clean_path)
-    
-    # 估算总时间和步长
-    total_dist = np.sum(np.hypot(np.diff(ref_path_clean[:, 0]), np.diff(ref_path_clean[:, 1])))
-    total_sim_time = (total_dist / v_uav) * 1.2
-    
-    # 执行物理仿真导航 (将 erro_radius 放宽到 150.0，防止因气动转弯超调错过航路点)
-    actual_traj = uav_navi_traverse(ref_path_clean, total_sim_time, 0.02, v_uav, 150.0)
-    return actual_traj
+
+    ref_path_clean = _dedupe_path_m(ref_path_m, min_sep_m=5.0)
+    visual_ref_path = _clip_path_to_demo_bounds_m(ref_path_clean)
+    if len(visual_ref_path) < 2:
+        return np.empty((0, 2))
+
+    # 估算总时间和步长。连续动力学跟踪会在 Dubins/螺旋密集航点处产生
+    # 额外转向耗时，时间预算过紧会截断最后一个目标的搜索轨迹。
+    total_dist = np.sum(np.hypot(np.diff(visual_ref_path[:, 0]), np.diff(visual_ref_path[:, 1])))
+    total_sim_time = (total_dist / v_uav) * 2.0 + 120.0
+
+    actual_traj = uav_navi_traverse(visual_ref_path, total_sim_time, 0.02, v_uav, 150.0)
+    if len(actual_traj) == 0:
+        return _visual_reference_traj_m(visual_ref_path)
+
+    terminal_error = np.hypot(
+        actual_traj[-1, 0] - visual_ref_path[-1, 0],
+        actual_traj[-1, 1] - visual_ref_path[-1, 1],
+    )
+    visual_bad = (
+        _path_out_of_demo_bounds_m(actual_traj)
+        or terminal_error > 500.0
+    )
+    if visual_bad:
+        print(
+            f"[WARN] Demo visualization fallback: "
+            f"terminal error = {terminal_error / 1000.0:.2f} km, "
+            f"out_of_bounds = {_path_out_of_demo_bounds_m(actual_traj)}"
+        )
+        return _visual_reference_traj_m(visual_ref_path)
+
+    return _clip_path_to_demo_bounds_m(actual_traj)
 
 
 # ==================== 演示主函数 ====================
-def run_emergency_demo(emergency_type='random', model_path='outputs/models/emergency_dqn_model.pt'):
+def trim_polyline_prefix(path_m, trim_m):
+    """从完整螺旋搜索路径中移除已搜索的举例，沿多段线累计长度裁掉前缀，并在裁剪点做线性插值，保证剩余路径从真实续搜点开始，而不是粗暴从某个离散点开始"""
+    path_m = np.asarray(path_m, dtype=float)
+    if len(path_m) < 2 or trim_m <= 0:
+        return path_m
+
+    remaining = float(trim_m)
+    for i in range(len(path_m) - 1):
+        p0 = path_m[i]
+        p1 = path_m[i + 1]
+        seg_len = np.hypot(p1[0] - p0[0], p1[1] - p0[1])
+        if seg_len <= 1e-9:
+            continue
+        if remaining <= seg_len:
+            frac = remaining / seg_len
+            start = p0 + frac * (p1 - p0)
+            return np.vstack([start, path_m[i + 1:]])
+        remaining -= seg_len
+
+    return path_m[-1:].copy()
+
+
+def polyline_length_m(path_m):
+    path_m = np.asarray(path_m, dtype=float)
+    if len(path_m) < 2:
+        return 0.0
+    return float(np.sum(np.hypot(np.diff(path_m[:, 0]), np.diff(path_m[:, 1]))))
+
+
+def slice_polyline_by_distance(path_m, start_m, end_m):
+    """Return a path slice between two cumulative distances on a polyline."""
+    path_m = np.asarray(path_m, dtype=float)
+    if len(path_m) < 2:
+        return path_m.copy()
+
+    start_m = max(0.0, float(start_m))
+    end_m = min(float(end_m), polyline_length_m(path_m))
+    if end_m <= start_m:
+        return path_m[-1:].copy()
+
+    points = []
+    cumsum = 0.0
+    for i in range(len(path_m) - 1):
+        p0 = path_m[i]
+        p1 = path_m[i + 1]
+        seg = p1 - p0
+        seg_len = float(np.hypot(seg[0], seg[1]))
+        if seg_len <= 1e-9:
+            continue
+        next_cumsum = cumsum + seg_len
+
+        if next_cumsum >= start_m and cumsum <= end_m:
+            local_start = max(start_m, cumsum)
+            local_end = min(end_m, next_cumsum)
+            a = (local_start - cumsum) / seg_len
+            b = (local_end - cumsum) / seg_len
+            start_pt = p0 + a * seg
+            end_pt = p0 + b * seg
+            if not points or np.hypot(*(start_pt - points[-1])) > 1e-6:
+                points.append(start_pt)
+            points.append(end_pt)
+
+        if next_cumsum >= end_m:
+            break
+        cumsum = next_cumsum
+
+    return np.asarray(points, dtype=float)
+
+def run_emergency_demo(emergency_type='random', model_path='outputs/models/emergency_dqn_model.pt',
+                       show=True):
     # ---- 0. 全局绘图规范配置 ----
     plt.rcParams.update({
         'font.family': 'serif',
@@ -134,6 +353,11 @@ def run_emergency_demo(emergency_type='random', model_path='outputs/models/emerg
     best_chrom, best_cost, _, norm_factors = ga.run_ga(pop_size=200, generations=300, patience=100)
     _, raw_routes, _ = ga.evaluate_chromosome(best_chrom, norm_factors)
     baseline_routes = raw_routes[:NUM_UAVS]
+    baseline_routes, baseline_inserted = fill_feasible_baseline_abandoned_targets(
+        sim, baseline_routes, UNIFIED_HOTSPOTS
+    )
+    if baseline_inserted:
+        print(f"GA baseline feasible-fill inserted targets: {baseline_inserted}")
     print(f"原始分配: {baseline_routes}")
 
     # ---- 4. 生成基线参考路径 & 动力学解算 (供左图展示) ----
@@ -195,8 +419,14 @@ def run_emergency_demo(emergency_type='random', model_path='outputs/models/emerg
         sim.simulate_until_emergency(ref_paths, emergency, baseline_routes, route_boundaries_list)
 
     if etype == 'S1':
-        emergency['shifts'] = [s for s in emergency.get('shifts', []) if s['id'] not in completed and s['id'] not in active_target_ids]
-        emergency['affected_targets'] = [tid for tid in emergency.get('affected_targets', []) if tid not in completed and tid not in active_target_ids]
+        active_ids = {tid for tid in active_target_ids if tid is not None}
+        shift_eligible = set(remaining) - active_ids
+        if not shift_eligible:
+            shift_eligible = set(remaining)
+        emergency = sim._generate_s1(
+            eligible_ids=shift_eligible,
+            trigger_time_frac=emergency.get('trigger_time_frac', 0.5),
+        )
 
     modified_hotspots, active_uavs, _ = sim.apply_emergency(emergency)
     remaining_ids = set(remaining)
@@ -213,31 +443,43 @@ def run_emergency_demo(emergency_type='random', model_path='outputs/models/emerg
     for h in UNIFIED_HOTSPOTS:
         if h['id'] not in id_to_hotspot: id_to_hotspot[h['id']] = h
 
-    state = sim.reset_v2(uav_positions, consumed_ranges, modified_hotspots,
-                         active_uavs=active_uavs, completed=completed,
-                         active_target_ids=active_target_ids, progress_kms=progress_kms,
-                         emergency=emergency)
-    done = False
-    while not done:
-        all_locked = [idx for idx in sim.locked_target_idxs if idx is not None]
-        valid_mask = get_valid_actions_v2(sim.current_uav_idx, sim.uav_states, sim.targets,
-                                          locked_target_idx=sim.locked_target_idxs[sim.current_uav_idx],
-                                          emergency=emergency, all_locked_idxs=all_locked)
-        if not valid_mask.any(): break
-        with torch.no_grad():
-            q_values = dqn(torch.FloatTensor(state).unsqueeze(0).to(device)).squeeze(0).cpu().numpy()
-        action = int(np.argmax(np.where(valid_mask, q_values, -np.inf)))
-        t = sim.targets[action]
-        decisions.append((t, sim.current_uav_idx))
-        state, _, done, _ = sim.step_v2(action)
+    local_detour_feasible = False
+    if etype == 'S3':
+        clean_routes, local_detour_feasible, _ = sim.s3_local_detour_routes(
+            dqn_routes, active_uavs, consumed_ranges,
+            uav_positions=uav_positions, emergency=emergency,
+            baseline_routes=baseline_routes, completed=completed,
+            active_target_ids=active_target_ids, progress_kms=progress_kms,
+        )
 
-    clean_routes = [[] for _ in range(NUM_UAVS)]
-    for t, uav_idx in decisions:
-        clean_routes[uav_idx].append(t['id'])
+    if not local_detour_feasible:
+        state = sim.reset_v2(uav_positions, consumed_ranges, modified_hotspots,
+                             active_uavs=active_uavs, completed=completed,
+                             active_target_ids=active_target_ids, progress_kms=progress_kms,
+                             emergency=emergency)
+        done = False
+        while not done:
+            all_locked = [idx for idx in sim.locked_target_idxs if idx is not None]
+            valid_mask = get_valid_actions_v2(sim.current_uav_idx, sim.uav_states, sim.targets,
+                                              locked_target_idx=sim.locked_target_idxs[sim.current_uav_idx],
+                                              emergency=emergency, all_locked_idxs=all_locked)
+            if not valid_mask.any(): break
+            with torch.no_grad():
+                q_values = dqn(torch.FloatTensor(state).unsqueeze(0).to(device)).squeeze(0).cpu().numpy()
+            action = int(np.argmax(np.where(valid_mask, q_values, -np.inf)))
+            t = sim.targets[action]
+            decisions.append((t, sim.current_uav_idx))
+            state, _, done, _ = sim.step_v2(action)
+
+        clean_routes = [[] for _ in range(NUM_UAVS)]
+        for t, uav_idx in decisions:
+            clean_routes[uav_idx].append(t['id'])
 
     dqn_cost = sim.compute_cost_for_assignment(
         clean_routes, modified_hotspots, active_uavs, emergency,
-        consumed_ranges, uav_positions=uav_positions, baseline_routes=baseline_routes, completed=completed)
+        consumed_ranges, uav_positions=uav_positions, baseline_routes=baseline_routes,
+        completed=completed, active_target_ids=active_target_ids,
+        progress_kms=progress_kms)
     print(f"DQN分配 (重排序后): {clean_routes}")
 
     # ---- 7. DQN 重规划参考路径 & 动力学解算 (供右图展示) ----
@@ -257,40 +499,82 @@ def run_emergency_demo(emergency_type='random', model_path='outputs/models/emerg
         curr_pose = [curr_pos_m[0], curr_pos_m[1], curr_yaw]
         full_path_m = [curr_pos_m]
 
-        # S3 禁飞区引导节点生成 (采用 Dubins 圆滑过渡)
-        if etype == 'S3' and len(detour_paths) > k and len(detour_paths[k]) > 0:
-            pts = detour_paths[k]
-            target_centers = [tgt['center_km'] for tgt in modified_hotspots]
-            for pt in pts[1:-1]:
-                is_tgt = any(np.hypot(pt[0]-tc[0], pt[1]-tc[1]) < 1e-3 for tc in target_centers)
-                if not is_tgt:
-                    pt_m = [pt[0]*1000.0, pt[1]*1000.0]
-                    yaw = math.atan2(pt_m[1] - curr_pose[1], pt_m[0] - curr_pose[0])
-                    d_path, _ = dubins_curve(curr_pose, [pt_m[0], pt_m[1], yaw], r=spiral_cfg['uav']['Rmin'], stepsize=200.0)
-                    if d_path is not None:
-                        full_path_m.extend(d_path[:, 0:2].tolist())
-                    else:
-                        full_path_m.append(pt_m)
-                    curr_pose = [pt_m[0], pt_m[1], yaw]
-
         # 遍历目标生成 Dubins + 螺旋线
-        for tgt_idx in route:
+        for route_order, tgt_idx in enumerate(route):
             tgt = next((h for h in modified_hotspots if h['id'] == tgt_idx), None)
             if tgt is None: continue
             
             target_m = [tgt['center_km'][0] * 1000.0, tgt['center_km'][1] * 1000.0]
+            continued_search = (
+                route_order == 0
+                and k < len(active_target_ids)
+                and active_target_ids[k] == tgt_idx
+                and k < len(progress_kms)
+                and progress_kms[k] > 0
+            )
+
+            if continued_search:
+                ref_path = ref_paths[k] if k < len(ref_paths) else np.empty((0, 2))
+                baseline_route = baseline_routes[k] if k < len(baseline_routes) else []
+                if len(ref_path) >= 2 and tgt_idx in baseline_route:
+                    baseline_order = baseline_route.index(tgt_idx)
+                    if k < len(route_boundaries_list) and baseline_order < len(route_boundaries_list[k]):
+                        trigger_dist_m = emergency.get('trigger_time_frac', 0.5) * polyline_length_m(ref_path)
+                        target_done_dist_m = route_boundaries_list[k][baseline_order]
+                        remaining_active_path = slice_polyline_by_distance(
+                            ref_path, trigger_dist_m, target_done_dist_m
+                        )
+                        if len(remaining_active_path) >= 2:
+                            remaining_active_path[0] = np.array(curr_pose[:2], dtype=float)
+                            full_path_m.extend(remaining_active_path[1:].tolist())
+                            tail = remaining_active_path[-1]
+                            prev = remaining_active_path[-2]
+                            curr_pose = [
+                                tail[0], tail[1],
+                                math.atan2(tail[1] - prev[1], tail[0] - prev[0])
+                            ]
+                            continue
+
+            if etype == 'S3' and not continued_search:
+                curr_km = (curr_pose[0] / 1000.0, curr_pose[1] / 1000.0)
+                detour_waypoints = compute_detour_waypoints_km(
+                    curr_km, tgt['center_km'],
+                    emergency['no_fly_center'][0],
+                    emergency['no_fly_center'][1],
+                    emergency['no_fly_radius'],
+                    min_turn_radius_km=spiral_cfg['uav']['Rmin'] / 1000.0,
+                )
+                if detour_waypoints:
+                    detour_points_m = [
+                        [wp[0] * 1000.0, wp[1] * 1000.0]
+                        for wp in detour_waypoints
+                    ]
+                    full_path_m.extend(detour_points_m)
+                    last_pt = detour_points_m[-1]
+                    yaw = math.atan2(target_m[1] - last_pt[1], target_m[0] - last_pt[0])
+                    curr_pose = [last_pt[0], last_pt[1], yaw]
+
             yaw_to_tgt = math.atan2(target_m[1] - curr_pose[1], target_m[0] - curr_pose[0])
             spiral_sol = spiral_search_arc_exact(prob_grid, tgt['center_km'], tgt['radius_km'], X_km, Y_km, yaw_to_tgt, spiral_cfg)
-            
-            s_path = spiral_sol['path'][::10]
+            if continued_search:
+                s_full = trim_polyline_prefix(spiral_sol['path'], progress_kms[k] * 1000.0)
+            else:
+                s_full = spiral_sol['path']
+            if len(s_full) < 2:
+                continue
+
+            s_path = s_full[::10]
+            if np.hypot(s_path[-1][0] - s_full[-1][0], s_path[-1][1] - s_full[-1][1]) > 1e-6:
+                s_path = np.vstack([s_path, s_full[-1]])
             s_start_yaw = math.atan2(s_path[1][1] - s_path[0][1], s_path[1][0] - s_path[0][0])
-            dubins_goal = [s_path[0][0], s_path[0][1], s_start_yaw]
-            
-            d_path, _ = dubins_curve(curr_pose, dubins_goal, r=spiral_cfg['uav']['Rmin'], stepsize=200.0)
-            if d_path is not None: full_path_m.extend(d_path[:, 0:2].tolist())
+
+            if not continued_search or np.hypot(s_path[0][0] - curr_pose[0], s_path[0][1] - curr_pose[1]) > 50.0:
+                dubins_goal = [s_path[0][0], s_path[0][1], s_start_yaw]
+                d_path, _ = dubins_curve(curr_pose, dubins_goal, r=spiral_cfg['uav']['Rmin'], stepsize=200.0)
+                if d_path is not None: full_path_m.extend(d_path[:, 0:2].tolist())
             full_path_m.extend(s_path.tolist())
             
-            curr_pose = [spiral_sol['pEnd'][0], spiral_sol['pEnd'][1], spiral_sol['yawEnd']]
+            curr_pose = [s_path[-1][0], s_path[-1][1], math.atan2(s_path[-1][1] - s_path[-2][1], s_path[-1][0] - s_path[-2][0])]
             
         actual_dqn_trajectories.append(generate_aero_traj(full_path_m, UAV_V_M_S))
 
@@ -322,12 +606,29 @@ def run_emergency_demo(emergency_type='random', model_path='outputs/models/emerg
             ax.add_patch(Circle((cx, cy), tgt['radius_km'], color=color, fill=True, alpha=0.15))
             ax.scatter(cx, cy, s=70, color=color, edgecolors='black', linewidth=1.0, alpha=alpha, zorder=5)
 
-            # S1 原位置引导线
+            # S1 原位置与位移方向
             if not is_baseline and etype == 'S1' and tgt['id'] in original_pos:
                 ox, oy = original_pos[tgt['id']]
                 if abs(cx - ox) > 0.5 or abs(cy - oy) > 0.5:
-                    ax.add_patch(Circle((ox, oy), tgt['radius_km'], fill=False, color='gray', alpha=0.6, linestyle='--', linewidth=1.2))
-                    ax.annotate('', xy=(cx, cy), xytext=(ox, oy), arrowprops=dict(arrowstyle='->', color='gray', lw=1.5, alpha=0.7, linestyle='dashed'))
+                    ax.add_patch(Circle((ox, oy), tgt['radius_km'], fill=False,
+                                        color='#6c757d', alpha=0.85,
+                                        linestyle='--', linewidth=1.6, zorder=6))
+                    ax.scatter(ox, oy, s=55, facecolors='white', edgecolors='#6c757d',
+                               linewidth=1.5, marker='o', zorder=16)
+                    ax.annotate(
+                        '', xy=(cx, cy), xytext=(ox, oy),
+                        arrowprops=dict(
+                            arrowstyle='-|>', color='#b45f06', lw=2.2,
+                            alpha=0.95, linestyle='--', mutation_scale=14,
+                        ),
+                        zorder=17,
+                    )
+                    ax.text(ox + 1.0, oy - 2.0, f"Old T{tgt['id']}",
+                            fontsize=9, color='#5c5c5c', fontweight='bold',
+                            path_effects=text_outline, zorder=18)
+                    ax.text(cx + 1.0, cy - 2.2, "Shifted",
+                            fontsize=9, color='#9a4d00', fontweight='bold',
+                            path_effects=text_outline, zorder=18)
 
             # 绘制区域 ID（删去白色底框，采用描边特效）
             label = f"T{tgt['id']}" + ('(X)' if is_abandoned and not is_baseline else '')
@@ -427,13 +728,23 @@ def run_emergency_demo(emergency_type='random', model_path='outputs/models/emerg
     plt.tight_layout(rect=(0.0, 0.0, 1.0, 0.94))
     output_path = f'outputs/eval/demo_phys_{etype}.png'
     plt.savefig(output_path, dpi=300, bbox_inches='tight')
-    print(f"✅ 全物理仿真演示图已生成: {output_path}")
-    plt.show()
+    print(f"Demo figure saved: {output_path}")
+    if show:
+        plt.show()
+    else:
+        plt.close(fig)
 
 if __name__ == '__main__':
     import argparse
     parser = argparse.ArgumentParser()
-    parser.add_argument('--type', choices=['S1', 'S2', 'S3', 'S4', 'random'], default='random')
+    parser.add_argument('--type', choices=['S1', 'S2', 'S3', 'S4', 'random', 'all'], default='random',
+                        help='突发事件类型；all 会依次运行 S1/S2/S3/S4')
     parser.add_argument('--model-path', type=str, default='outputs/models/emergency_dqn_model.pt')
+    parser.add_argument('--no-show', action='store_true',
+                        help='只保存图片，不弹出 Matplotlib 窗口；批量运行时推荐开启')
     args = parser.parse_args()
-    run_emergency_demo(args.type, args.model_path)
+    if args.type == 'all':
+        for etype in ['S1', 'S2', 'S3', 'S4']:
+            run_emergency_demo(etype, args.model_path, show=not args.no_show)
+    else:
+        run_emergency_demo(args.type, args.model_path, show=not args.no_show)

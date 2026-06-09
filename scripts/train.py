@@ -1,9 +1,10 @@
-"""
+﻿"""
 DQN突发事件临机决策 — 训练脚本 (V2 轮询MDP)
 """
 import os
 import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 import argparse
 import numpy as np
 import torch
@@ -20,7 +21,7 @@ from emergency.simulator import EmergencySimulator
 from emergency.utils import (
     EmergencyFSM, get_affected_targets,
     SPAN_KM, MAX_RANGE_KM, MAX_FLIGHT_TIME_S, GLOBAL_C_DROP,
-    STATE_DIM_V2, N_MAX, get_valid_actions_v2
+    STATE_DIM_V2, N_MAX, R_SUCCESS, get_valid_actions_v2
 )
 
 # ==================== 全局配置 ====================
@@ -58,24 +59,32 @@ spiral_cfg = {
 ORACLE_COMPUTE_INTERVAL = 50  # 每N回合计算一次GA oracle (降低频率加速训练)
 
 
+def resolve_project_path(path):
+    return path if os.path.isabs(path) else os.path.join(PROJECT_ROOT, path)
+
 # ==================== 检查点存取 ====================
+
+def _checkpoint_dir(model_save_path):
+    model_dir = os.path.dirname(model_save_path) or '.'
+    return os.path.join(os.path.dirname(model_dir), 'checkpoints')
 
 def _make_ckpt_path(model_save_path, episode):
     model_name = os.path.splitext(os.path.basename(model_save_path))[0]
-    return os.path.join('outputs/checkpoints', f'{model_name}_ckpt_ep{episode:06d}.pt')
+    return os.path.join(_checkpoint_dir(model_save_path), f'{model_name}_ckpt_ep{episode:06d}.pt')
 
 
 def find_latest_ckpt(model_save_path):
-    os.makedirs('outputs/checkpoints', exist_ok=True)
+    ckpt_dir = _checkpoint_dir(model_save_path)
+    os.makedirs(ckpt_dir, exist_ok=True)
     model_name = os.path.splitext(os.path.basename(model_save_path))[0]
     pattern = f'{model_name}_ckpt_ep'
-    candidates = [f for f in os.listdir('outputs/checkpoints')
+    candidates = [f for f in os.listdir(ckpt_dir)
                   if f.startswith(pattern) and f.endswith('.pt')
                   and '_buffer' not in f]
     if not candidates:
         return None
     candidates.sort(key=lambda x: int(x.replace(pattern, '').replace('.pt', '')))
-    return os.path.join('outputs/checkpoints', candidates[-1])
+    return os.path.join(ckpt_dir, candidates[-1])
 
 
 def save_checkpoint(ckpt_path, online_net, target_net, optimizer, replay_buffer,
@@ -106,6 +115,29 @@ def save_checkpoint(ckpt_path, online_net, target_net, optimizer, replay_buffer,
                         priority_min=np.array(buf.priority_min))
 
 
+
+def prepare_csv_log(csv_log_path, loaded_from_ckpt, start_episode):
+    header = ('episode,reward,loss,epsilon,steps,J_max,J_sum,buffer_size,'
+              'range_violations,max_range_ratio,abandoned,'
+              'abandon_avg_w,assign_avg_w,coverage\n')
+    os.makedirs(os.path.dirname(csv_log_path), exist_ok=True)
+    if not loaded_from_ckpt or not os.path.exists(csv_log_path):
+        with open(csv_log_path, 'w', encoding='utf-8') as f:
+            f.write(header)
+        return
+
+    with open(csv_log_path, 'r', encoding='utf-8') as f:
+        lines = f.readlines()
+    kept = [header]
+    for line in lines[1:]:
+        parts = line.split(',', 1)
+        if not parts or not parts[0].strip().isdigit():
+            continue
+        if int(parts[0]) <= start_episode:
+            kept.append(line)
+    with open(csv_log_path, 'w', encoding='utf-8') as f:
+        f.writelines(kept)
+
 def load_checkpoint(ckpt_path, device, buffer_capacity, state_dim=STATE_DIM_V2, alpha=0.6):
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
 
@@ -125,6 +157,12 @@ def load_checkpoint(ckpt_path, device, buffer_capacity, state_dim=STATE_DIM_V2, 
     if os.path.exists(buf_path):
         buf_data = np.load(buf_path)
         saved_size = int(buf_data['size'])
+        if saved_size > buffer_capacity:
+            raise ValueError(
+                f"检查点回放缓存包含 {saved_size} 条样本，但当前 buffer_capacity={buffer_capacity}。"
+                "请使用不小于检查点样本数的 --buffer-capacity 续训，避免截断回放缓存。"
+            )
+
 
         # 1. 恢复基础状态数据
         replay_buffer.data['state'][:saved_size] = buf_data['state']
@@ -170,8 +208,8 @@ def load_checkpoint(ckpt_path, device, buffer_capacity, state_dim=STATE_DIM_V2, 
 
 # ==================== 训练主函数 ====================
 
-def train(num_episodes=500000, batch_size=128, lr=1e-4, gamma=0.95,
-          target_update_freq=1000, buffer_capacity=500000,
+def train(num_episodes=80000, batch_size=128, lr=1e-4, gamma=0.95,
+          target_update_freq=1000, buffer_capacity=200000,
           model_save_path='outputs/models/emergency_dqn_model.pt',
           log_interval=100, save_interval=5000,
           resume_path=None, oracle_interval=ORACLE_COMPUTE_INTERVAL):
@@ -190,6 +228,7 @@ def train(num_episodes=500000, batch_size=128, lr=1e-4, gamma=0.95,
         resume_path: 断点续训检查点路径
         oracle_interval: GA oracle计算间隔
     """
+    model_save_path = resolve_project_path(model_save_path)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"使用设备: {device}")
     print(f"动作空间: {N_MAX}维 (轮询MDP, N_MAX={N_MAX})")
@@ -327,7 +366,7 @@ def train(num_episodes=500000, batch_size=128, lr=1e-4, gamma=0.95,
 
     epsilon_min = 0.05
     # 指数衰减：0.9999^30000 ≈ 0.049，断点续训兼容（基于当前epsilon值衰减，不依赖全局回合数），50w回合用0.99999更平滑一些，避免过早衰减到极小值导致训练停滞
-    epsilon_decay = 0.9999
+    epsilon_decay = 0.99995
     beta_start = 0.4
     beta_end = 1.0
 
@@ -343,18 +382,10 @@ def train(num_episodes=500000, batch_size=128, lr=1e-4, gamma=0.95,
     best_avg_reward = -float('inf')
     oracle_cost_ema = None  # GA oracle代价的指数移动平均
 
-    # ========== 修复：CSV增量日志追加逻辑 ==========
+    # ========== CSV增量日志追加逻辑 ==========
     csv_log_path = model_save_path.replace('.pt', '_log.csv')
-    file_exists = os.path.exists(csv_log_path)
-    
-    # 只有在明确不读取断点，或者文件确实不存在时，才写入表头（清空旧文件）
-    if not loaded_from_ckpt or not file_exists:
-        os.makedirs(os.path.dirname(csv_log_path), exist_ok=True)
-        with open(csv_log_path, 'w') as f:
-            f.write('episode,reward,loss,epsilon,steps,J_max,J_sum,buffer_size,'
-                    'range_violations,max_range_ratio,abandoned,'
-                    'abandon_avg_w,assign_avg_w,coverage\n')
-            
+    prepare_csv_log(csv_log_path, loaded_from_ckpt, start_episode)
+
     # ========== 修复：历史记录数组长度对齐 ==========
     # 防止断点续训后存入 .npz 时，J_max 和 J_sum 长度跟 rewards 不匹配导致数据损坏
     episode_J_max = [0.0] * start_episode
@@ -396,6 +427,44 @@ def train(num_episodes=500000, batch_size=128, lr=1e-4, gamma=0.95,
             if emergency['type'] == 'S2':
                 for nt in emergency.get('new_targets', []):
                     remaining.add(nt['id'])
+
+            if emergency['type'] == 'S3':
+                current_routes = [[tid for tid in r if tid not in completed]
+                                  for r in baseline_routes]
+                _, local_detour_feasible, _ = sim.s3_local_detour_routes(
+                    current_routes, active_uavs, consumed_ranges,
+                    uav_positions=uav_positions, emergency=emergency,
+                    baseline_routes=baseline_routes, completed=completed,
+                    active_target_ids=active_target_ids, progress_kms=progress_kms,
+                )
+                if local_detour_feasible:
+                    episode_rewards.append(R_SUCCESS)
+                    episode_losses.append(current_loss)
+                    episode_J_max.append(0.0)
+                    episode_J_sum.append(0.0)
+                    epsilon = max(epsilon_min, epsilon * epsilon_decay)
+                    n_targets = len(modified_hotspots)
+                    with open(csv_log_path, 'a', encoding='utf-8') as f:
+                        f.write(f'{current_episode},{episode_rewards[-1]:.4f},{current_loss:.6f},'
+                                f'{epsilon:.4f},{n_targets},'
+                                f'0.0,0.0,'
+                                f'{replay_buffer.size},0,0.0000,'
+                                f'0,0.000,1.000,1.000\n')
+                    pbar.set_postfix({
+                        'reward': f'{np.mean(episode_rewards[-10:]):+.3f}',
+                        'loss': f'{np.mean(episode_losses[-10:]) if episode_losses else 0.0:.4f}',
+                        'eps': f'{epsilon:.3f}',
+                        'buf': f'{replay_buffer.size}'
+                    })
+                    if current_episode % save_interval == 0:
+                        ckpt_path = _make_ckpt_path(model_save_path, current_episode)
+                        save_checkpoint(ckpt_path, online_net, target_net, optimizer,
+                                        replay_buffer, epsilon, step_count,
+                                        current_episode, episode_rewards, episode_losses)
+                        os.makedirs(os.path.dirname(model_save_path), exist_ok=True)
+                        torch.save(online_net.state_dict(), model_save_path)
+                        tqdm.write(f"  -> 检查点+模型已保存 ep{current_episode}")
+                    continue
 
             # 获取受影响目标列表 (按权重降序)，排除已完成目标
             affected = get_affected_targets(emergency, baseline_routes, modified_hotspots)
@@ -614,16 +683,16 @@ def train(num_episodes=500000, batch_size=128, lr=1e-4, gamma=0.95,
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='DQN突发事件临机决策训练 (5动作, 多步MDP)')
-    parser.add_argument('--episodes', type=int, default=500000,
-                        help='训练回合数 (默认: 500000)')
+    parser.add_argument('--episodes', type=int, default=80000,
+                        help='训练回合数 (默认: 80000)')
     parser.add_argument('--batch-size', type=int, default=128,
-                        help='小批量大小 (默认: 64)')
+                        help='小批量大小 (默认: 128)')
     parser.add_argument('--lr', type=float, default=1e-4,
                         help='学习率 (默认: 1e-4)')
     parser.add_argument('--model-path', type=str, default='outputs/models/emergency_dqn_model.pt',
                         help='模型保存路径')
-    parser.add_argument('--buffer-capacity', type=int, default=100000,
-                        help='回放缓存容量 (默认: 100000)')
+    parser.add_argument('--buffer-capacity', type=int, default=200000,
+                        help='回放缓存容量 (默认: 200000)')
     parser.add_argument('--target-update', type=int, default=1000,
                         help='Target网络更新间隔 (默认: 1000)')
     parser.add_argument('--resume', type=str, default='auto',
